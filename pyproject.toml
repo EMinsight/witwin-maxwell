@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "witwin-maxwell"
-version = "0.1.0"
+version = "0.0.1"
 description = "Witwin Maxwell - Electromagnetic simulation (FDTD/FDFD)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = "GPL-3.0-or-later"
 license-files = ["COPYING"]
 
 dependencies = [
-    "witwin>=0.1.0",
+    "witwin>=0.0.1",
     "numpy>=1.24",
     "torch>=2.0",
     "scipy>=1.10",
