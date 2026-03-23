@@ -1,0 +1,479 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+import torch
+
+from ..boundary import has_complex_fields
+from ..observers import get_observer_results as get_observer_results_impl
+from ..postprocess import get_frequency_solution as get_frequency_solution_impl
+
+
+def _runtime():
+    from . import core as _adjoint
+
+    return _adjoint
+
+
+@dataclass(frozen=True)
+class _FieldAccumulatorPair:
+    entry_index: int
+    state_field_name: str
+    real_index: int
+    imag_index: int
+
+
+@dataclass(frozen=True)
+class _PointAccumulatorPair:
+    state_field_name: str
+    global_indices: tuple[int, ...]
+    point_i: torch.Tensor
+    point_j: torch.Tensor
+    point_k: torch.Tensor
+    real_index: int
+    imag_index: int
+
+
+@dataclass(frozen=True)
+class _PlaneAccumulatorPair:
+    state_field_name: str
+    global_indices: tuple[int, ...]
+    axis_code: int
+    plane_index: int
+    real_index: int
+    imag_index: int
+
+
+@dataclass(frozen=True)
+class _ScheduleTensorPack:
+    cos: torch.Tensor
+    sin: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _DenseSeedBatch:
+    state_field_name: str
+    entry_indices: torch.Tensor
+    grad_real: torch.Tensor
+    grad_imag: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _PointSeedBatch:
+    state_field_name: str
+    entry_indices: torch.Tensor
+    point_i: torch.Tensor
+    point_j: torch.Tensor
+    point_k: torch.Tensor
+    grad_real: torch.Tensor
+    grad_imag: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _PlaneSeedBatch:
+    state_field_name: str
+    axis_code: int
+    plane_index: int
+    entry_indices: torch.Tensor
+    grad_real: torch.Tensor
+    grad_imag: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _SeedRuntime:
+    dft_schedule: _ScheduleTensorPack
+    observer_schedule: _ScheduleTensorPack
+    dense_batches: tuple[_DenseSeedBatch, ...]
+    point_batches: tuple[_PointSeedBatch, ...]
+    plane_batches: tuple[_PlaneSeedBatch, ...]
+    backend: str = "device_batched"
+
+
+def _schedule_to_tensor_pack(schedules, *, device, dtype) -> _ScheduleTensorPack:
+    if not schedules:
+        empty = torch.zeros((0, 0), device=device, dtype=dtype)
+        return _ScheduleTensorPack(cos=empty, sin=empty)
+    cos = torch.tensor(
+        [[float(weight_cos) for weight_cos, _weight_sin in entry] for entry in schedules],
+        device=device,
+        dtype=dtype,
+    )
+    sin = torch.tensor(
+        [[float(weight_sin) for _weight_cos, weight_sin in entry] for entry in schedules],
+        device=device,
+        dtype=dtype,
+    )
+    return _ScheduleTensorPack(cos=cos, sin=sin)
+
+
+def _reshape_entry_major_grad(grad: torch.Tensor, entry_count: int) -> torch.Tensor:
+    if entry_count <= 0:
+        raise ValueError("Seed batch must contain at least one entry.")
+    detached = grad.detach()
+    if entry_count == 1:
+        if detached.ndim == 0 or detached.shape[0] != 1:
+            detached = detached.unsqueeze(0)
+        return detached.contiguous()
+    if detached.ndim == 0 or detached.shape[0] != entry_count:
+        raise RuntimeError(
+            "Seed gradient layout does not match the observer/global frequency index structure."
+        )
+    return detached.contiguous()
+
+
+def _stack_dense_seed_records(records) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    entry_indices = torch.tensor(
+        [int(entry_index) for entry_index, _grad_real, _grad_imag in records],
+        device=records[0][1].device,
+        dtype=torch.long,
+    )
+    grad_real = torch.stack([grad_real.detach() for _entry_index, grad_real, _grad_imag in records], dim=0).contiguous()
+    grad_imag = torch.stack([grad_imag.detach() for _entry_index, _grad_real, grad_imag in records], dim=0).contiguous()
+    return entry_indices, grad_real, grad_imag
+
+
+def _seed_batch_contribution(
+    grad_real: torch.Tensor,
+    grad_imag: torch.Tensor,
+    weight_cos: torch.Tensor,
+    weight_sin: torch.Tensor,
+) -> torch.Tensor:
+    view_shape = (int(weight_cos.shape[0]),) + (1,) * max(grad_real.ndim - 1, 0)
+    return torch.sum(
+        grad_real * weight_cos.view(view_shape) + grad_imag * weight_sin.view(view_shape),
+        dim=0,
+    )
+
+
+def _clone_seed_solver(solver):
+    seed_solver = SimpleNamespace()
+    seed_solver.verbose = False
+    seed_solver.complex_fields_enabled = has_complex_fields(solver)
+    seed_solver._normalize_source = getattr(solver, "_normalize_source", False)
+    seed_solver._source_time = getattr(solver, "_source_time", None)
+    seed_solver.dft_window_type = getattr(solver, "dft_window_type", "none")
+    seed_solver.observer_window_type = getattr(solver, "observer_window_type", "none")
+    seed_solver.observers_enabled = bool(getattr(solver, "observers_enabled", False))
+    seed_solver.observers = list(getattr(solver, "observers", ()))
+    seed_solver._point_observer_groups = {}
+    seed_solver._plane_observer_groups = {}
+
+    leaves = []
+    field_pairs = []
+    point_pairs = []
+    plane_pairs = []
+
+    seed_solver._dft_entries = []
+    for entry_index, entry in enumerate(getattr(solver, "_dft_entries", ())):
+        cloned_entry = dict(entry)
+        cloned_fields = {}
+        for field_name in ("Ex", "Ey", "Ez"):
+            payload = entry["fields"][field_name]
+            real = payload["real"].detach().clone().requires_grad_(True)
+            imag = payload["imag"].detach().clone().requires_grad_(True)
+            real_index = len(leaves)
+            imag_index = len(leaves) + 1
+            leaves.extend([real, imag])
+            field_pairs.append(
+                _FieldAccumulatorPair(
+                    entry_index=entry_index,
+                    state_field_name=field_name,
+                    real_index=real_index,
+                    imag_index=imag_index,
+                )
+            )
+            aux_real = None
+            aux_imag = None
+            if payload.get("aux_real") is not None and payload.get("aux_imag") is not None:
+                aux_real = payload["aux_real"].detach().clone().requires_grad_(True)
+                aux_imag = payload["aux_imag"].detach().clone().requires_grad_(True)
+                aux_real_index = len(leaves)
+                aux_imag_index = len(leaves) + 1
+                leaves.extend([aux_real, aux_imag])
+                field_pairs.append(
+                    _FieldAccumulatorPair(
+                        entry_index=entry_index,
+                        state_field_name=f"{field_name}_imag",
+                        real_index=aux_real_index,
+                        imag_index=aux_imag_index,
+                    )
+                )
+            cloned_fields[field_name] = {
+                "real": real,
+                "imag": imag,
+                "aux_real": aux_real,
+                "aux_imag": aux_imag,
+            }
+        cloned_entry["fields"] = cloned_fields
+        seed_solver._dft_entries.append(cloned_entry)
+
+    seed_solver._observer_spectral_entries = [dict(entry) for entry in getattr(solver, "_observer_spectral_entries", ())]
+
+    for group_key, group in getattr(solver, "_point_observer_groups", {}).items():
+        cloned_group = dict(group)
+        real = group["real"].detach().clone().requires_grad_(True)
+        imag = group["imag"].detach().clone().requires_grad_(True)
+        real_index = len(leaves)
+        imag_index = len(leaves) + 1
+        leaves.extend([real, imag])
+        point_pairs.append(
+            _PointAccumulatorPair(
+                state_field_name=group["field_name"],
+                global_indices=tuple(group["global_freq_indices"]),
+                point_i=group["point_i"].to(dtype=torch.long),
+                point_j=group["point_j"].to(dtype=torch.long),
+                point_k=group["point_k"].to(dtype=torch.long),
+                real_index=real_index,
+                imag_index=imag_index,
+            )
+        )
+        cloned_group["real"] = real
+        cloned_group["imag"] = imag
+        if "aux_real" in group and "aux_imag" in group:
+            aux_real = group["aux_real"].detach().clone().requires_grad_(True)
+            aux_imag = group["aux_imag"].detach().clone().requires_grad_(True)
+            aux_real_index = len(leaves)
+            aux_imag_index = len(leaves) + 1
+            leaves.extend([aux_real, aux_imag])
+            point_pairs.append(
+                _PointAccumulatorPair(
+                    state_field_name=f"{group['field_name']}_imag",
+                    global_indices=tuple(group["global_freq_indices"]),
+                    point_i=group["point_i"].to(dtype=torch.long),
+                    point_j=group["point_j"].to(dtype=torch.long),
+                    point_k=group["point_k"].to(dtype=torch.long),
+                    real_index=aux_real_index,
+                    imag_index=aux_imag_index,
+                )
+            )
+            cloned_group["aux_real"] = aux_real
+            cloned_group["aux_imag"] = aux_imag
+        seed_solver._point_observer_groups[group_key] = cloned_group
+
+    seed_solver._plane_observer_groups = {}
+    for group_key, group in getattr(solver, "_plane_observer_groups", {}).items():
+        cloned_group = dict(group)
+        real = group["real"].detach().clone().requires_grad_(True)
+        imag = group["imag"].detach().clone().requires_grad_(True)
+        real_index = len(leaves)
+        imag_index = len(leaves) + 1
+        leaves.extend([real, imag])
+        plane_pairs.append(
+            _PlaneAccumulatorPair(
+                state_field_name=group["field_name"],
+                global_indices=tuple(group["global_freq_indices"]),
+                axis_code=int(group["axis_code"]),
+                plane_index=int(group["plane_index"]),
+                real_index=real_index,
+                imag_index=imag_index,
+            )
+        )
+        cloned_group["real"] = real
+        cloned_group["imag"] = imag
+        if "aux_real" in group and "aux_imag" in group:
+            aux_real = group["aux_real"].detach().clone().requires_grad_(True)
+            aux_imag = group["aux_imag"].detach().clone().requires_grad_(True)
+            aux_real_index = len(leaves)
+            aux_imag_index = len(leaves) + 1
+            leaves.extend([aux_real, aux_imag])
+            plane_pairs.append(
+                _PlaneAccumulatorPair(
+                    state_field_name=f"{group['field_name']}_imag",
+                    global_indices=tuple(group["global_freq_indices"]),
+                    axis_code=int(group["axis_code"]),
+                    plane_index=int(group["plane_index"]),
+                    real_index=aux_real_index,
+                    imag_index=aux_imag_index,
+                )
+            )
+            cloned_group["aux_real"] = aux_real
+            cloned_group["aux_imag"] = aux_imag
+        seed_solver._plane_observer_groups[group_key] = cloned_group
+
+    return seed_solver, tuple(leaves), field_pairs, point_pairs, plane_pairs
+
+
+def _dense_seed_output_pairs(seed_solver):
+    runtime = _runtime()
+    raw_output = {}
+    if getattr(seed_solver, "_dft_entries", ()):
+        raw_output.update(
+            get_frequency_solution_impl(
+                seed_solver,
+                all_frequencies=True,
+            )
+        )
+    if getattr(seed_solver, "observers_enabled", False):
+        raw_output["observers"] = get_observer_results_impl(seed_solver)
+    return runtime._prepare_forward_pack(raw_output)
+
+
+def _build_output_seeds(
+    solver,
+    pack,
+    grad_outputs,
+    *,
+    dft_schedule: _ScheduleTensorPack,
+    observer_schedule: _ScheduleTensorPack,
+) -> _SeedRuntime:
+    runtime = _runtime()
+    with torch.enable_grad():
+        seed_solver, leaves, field_pairs, point_pairs, plane_pairs = _clone_seed_solver(solver)
+        seed_pack = _dense_seed_output_pairs(seed_solver)
+        if len(seed_pack.output_tensors) != len(pack.output_tensors):
+            raise RuntimeError("Adjoint output pack layout changed between forward and backward.")
+        output_grads = tuple(
+            torch.zeros_like(output) if grad_output is None else grad_output.to(device=output.device, dtype=output.dtype)
+            for output, grad_output in zip(seed_pack.output_tensors, grad_outputs)
+        )
+        leaf_grads = torch.autograd.grad(
+            seed_pack.output_tensors,
+            leaves,
+            grad_outputs=output_grads,
+            allow_unused=True,
+        )
+
+    dense_seed_records: dict[str, list[tuple[int, torch.Tensor, torch.Tensor]]] = {}
+    for pair in field_pairs:
+        real_leaf = leaves[pair.real_index]
+        imag_leaf = leaves[pair.imag_index]
+        dense_seed_records.setdefault(pair.state_field_name, []).append(
+            (
+                int(pair.entry_index),
+                runtime._safe_grad(leaf_grads[pair.real_index], real_leaf),
+                runtime._safe_grad(leaf_grads[pair.imag_index], imag_leaf),
+            )
+        )
+
+    dense_batches = []
+    for state_field_name, records in dense_seed_records.items():
+        entry_indices, grad_real, grad_imag = _stack_dense_seed_records(records)
+        dense_batches.append(
+            _DenseSeedBatch(
+                state_field_name=state_field_name,
+                entry_indices=entry_indices,
+                grad_real=grad_real,
+                grad_imag=grad_imag,
+            )
+        )
+
+    point_batches = []
+    for pair in point_pairs:
+        entry_count = len(pair.global_indices)
+        real_grad = _reshape_entry_major_grad(
+            runtime._safe_grad(leaf_grads[pair.real_index], leaves[pair.real_index]),
+            entry_count,
+        )
+        imag_grad = _reshape_entry_major_grad(
+            runtime._safe_grad(leaf_grads[pair.imag_index], leaves[pair.imag_index]),
+            entry_count,
+        )
+        point_batches.append(
+            _PointSeedBatch(
+                state_field_name=pair.state_field_name,
+                entry_indices=torch.tensor(pair.global_indices, device=real_grad.device, dtype=torch.long),
+                point_i=pair.point_i.to(device=real_grad.device, dtype=torch.long),
+                point_j=pair.point_j.to(device=real_grad.device, dtype=torch.long),
+                point_k=pair.point_k.to(device=real_grad.device, dtype=torch.long),
+                grad_real=real_grad,
+                grad_imag=imag_grad,
+            )
+        )
+
+    plane_batches = []
+    for pair in plane_pairs:
+        entry_count = len(pair.global_indices)
+        real_grad = _reshape_entry_major_grad(
+            runtime._safe_grad(leaf_grads[pair.real_index], leaves[pair.real_index]),
+            entry_count,
+        )
+        imag_grad = _reshape_entry_major_grad(
+            runtime._safe_grad(leaf_grads[pair.imag_index], leaves[pair.imag_index]),
+            entry_count,
+        )
+        plane_batches.append(
+            _PlaneSeedBatch(
+                state_field_name=pair.state_field_name,
+                axis_code=pair.axis_code,
+                plane_index=pair.plane_index,
+                entry_indices=torch.tensor(pair.global_indices, device=real_grad.device, dtype=torch.long),
+                grad_real=real_grad,
+                grad_imag=imag_grad,
+            )
+        )
+
+    return _SeedRuntime(
+        dft_schedule=dft_schedule,
+        observer_schedule=observer_schedule,
+        dense_batches=tuple(dense_batches),
+        point_batches=tuple(point_batches),
+        plane_batches=tuple(plane_batches),
+    )
+
+
+def _gather_step_weights(schedule: _ScheduleTensorPack, entry_indices: torch.Tensor, step_index: int):
+    if entry_indices.numel() == 0 or schedule.cos.numel() == 0:
+        empty = torch.zeros((0,), device=entry_indices.device, dtype=schedule.cos.dtype)
+        return empty, empty
+    weight_cos = schedule.cos.index_select(0, entry_indices)[:, int(step_index)]
+    weight_sin = schedule.sin.index_select(0, entry_indices)[:, int(step_index)]
+    return weight_cos, weight_sin
+
+
+def _apply_dense_seeds(adj_state, seed_runtime: _SeedRuntime, step_index):
+    for batch in seed_runtime.dense_batches:
+        weight_cos, weight_sin = _gather_step_weights(
+            seed_runtime.dft_schedule,
+            batch.entry_indices,
+            step_index,
+        )
+        contribution = _seed_batch_contribution(batch.grad_real, batch.grad_imag, weight_cos, weight_sin)
+        adj_state[batch.state_field_name] = adj_state[batch.state_field_name] + contribution.to(
+            device=adj_state[batch.state_field_name].device,
+            dtype=adj_state[batch.state_field_name].dtype,
+        )
+
+
+def _apply_point_seeds(adj_state, seed_runtime: _SeedRuntime, step_index):
+    for batch in seed_runtime.point_batches:
+        weight_cos, weight_sin = _gather_step_weights(
+            seed_runtime.observer_schedule,
+            batch.entry_indices,
+            step_index,
+        )
+        contribution = _seed_batch_contribution(batch.grad_real, batch.grad_imag, weight_cos, weight_sin)
+        adj_state[batch.state_field_name].index_put_(
+            (batch.point_i, batch.point_j, batch.point_k),
+            contribution.to(
+                device=adj_state[batch.state_field_name].device,
+                dtype=adj_state[batch.state_field_name].dtype,
+            ),
+            accumulate=True,
+        )
+
+
+def _apply_plane_seeds(adj_state, seed_runtime: _SeedRuntime, step_index):
+    for batch in seed_runtime.plane_batches:
+        weight_cos, weight_sin = _gather_step_weights(
+            seed_runtime.observer_schedule,
+            batch.entry_indices,
+            step_index,
+        )
+        contribution = _seed_batch_contribution(batch.grad_real, batch.grad_imag, weight_cos, weight_sin).to(
+            device=adj_state[batch.state_field_name].device,
+            dtype=adj_state[batch.state_field_name].dtype,
+        )
+        field = adj_state[batch.state_field_name]
+        if batch.axis_code == 0:
+            field[batch.plane_index, :, :].add_(contribution)
+        elif batch.axis_code == 1:
+            field[:, batch.plane_index, :].add_(contribution)
+        else:
+            field[:, :, batch.plane_index].add_(contribution)
+
+
+def _apply_seed_runtime(adj_state, seed_runtime: _SeedRuntime, step_index):
+    _apply_dense_seeds(adj_state, seed_runtime, step_index)
+    _apply_point_seeds(adj_state, seed_runtime, step_index)
+    _apply_plane_seeds(adj_state, seed_runtime, step_index)

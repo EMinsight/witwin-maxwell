@@ -1,0 +1,393 @@
+from __future__ import annotations
+
+from enum import Enum, auto
+
+import torch
+
+from ..boundary import (
+    BOUNDARY_BLOCH,
+    BOUNDARY_NONE,
+    BOUNDARY_PERIODIC,
+    BOUNDARY_PMC,
+    has_complex_fields,
+)
+from ..checkpoint import checkpoint_schema
+
+
+class _ReverseBackend(Enum):
+    TFSF = auto()
+    SLANG_CPML = auto()
+    SLANG_STANDARD = auto()
+    SLANG_DISPERSIVE = auto()
+    SLANG_BLOCH = auto()
+    PYTHON_BLOCH = auto()
+    PYTHON_DISPERSIVE = auto()
+    PYTHON_STANDARD = auto()
+    PYTHON_CPML = auto()
+    TORCH_VJP = auto()
+
+
+def _runtime():
+    from . import core as _adjoint
+
+    return _adjoint
+
+
+def _face_codes(solver) -> tuple[int, int, int, int, int, int]:
+    return (
+        int(getattr(solver, "boundary_x_low_code", BOUNDARY_NONE)),
+        int(getattr(solver, "boundary_x_high_code", BOUNDARY_NONE)),
+        int(getattr(solver, "boundary_y_low_code", BOUNDARY_NONE)),
+        int(getattr(solver, "boundary_y_high_code", BOUNDARY_NONE)),
+        int(getattr(solver, "boundary_z_low_code", BOUNDARY_NONE)),
+        int(getattr(solver, "boundary_z_high_code", BOUNDARY_NONE)),
+    )
+
+
+def _matches_checkpoint_layout(solver, forward_state) -> bool:
+    return tuple(forward_state.keys()) == checkpoint_schema(solver).state_names
+
+
+def _cuda_reverse_step_available(tensor: torch.Tensor) -> bool:
+    return torch.cuda.is_available() and torch.device(tensor.device).type == "cuda"
+
+
+def _has_open_face_conflicts(face_codes: tuple[int, int, int, int, int, int]) -> bool:
+    return any(code in {BOUNDARY_PERIODIC, BOUNDARY_PMC, BOUNDARY_BLOCH} for code in face_codes)
+
+
+def _supports_explicit_source_step(runtime, solver, resolved_source_terms) -> bool:
+    return runtime._can_use_explicit_source_term_reverse_step(solver, resolved_source_terms)
+
+
+def _supports_tfsf(runtime, solver, forward_state, resolved_source_terms) -> bool:
+    if not getattr(solver, "tfsf_enabled", False):
+        return False
+    if has_complex_fields(solver):
+        return False
+    if getattr(solver, "dispersive_enabled", False):
+        return False
+    if not _matches_checkpoint_layout(solver, forward_state):
+        return False
+    if _has_open_face_conflicts(_face_codes(solver)):
+        return False
+    if runtime._has_resolved_source_terms(resolved_source_terms):
+        return False
+
+    tfsf_state = getattr(solver, "_tfsf_state", None)
+    if tfsf_state is None:
+        return False
+    provider = tfsf_state.get("provider")
+    if provider not in {
+        "plane_wave_ref_x_ez",
+        "plane_wave_axis_aligned",
+        "plane_wave_aux",
+        "plane_wave_discrete_cw",
+        "analytic_profile",
+    }:
+        return False
+
+    auxiliary_grid = tfsf_state.get("auxiliary_grid")
+    has_auxiliary_state = "tfsf_aux_electric" in forward_state and "tfsf_aux_magnetic" in forward_state
+    if auxiliary_grid is None:
+        return not has_auxiliary_state
+    return has_auxiliary_state
+
+
+def _supports_standard(runtime, solver, forward_state, resolved_source_terms) -> bool:
+    if tuple(forward_state.keys()) != ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz"):
+        return False
+    if getattr(solver, "uses_cpml", False):
+        return False
+    if has_complex_fields(solver):
+        return False
+    if getattr(solver, "dispersive_enabled", False):
+        return False
+    if getattr(solver, "tfsf_enabled", False):
+        return False
+    if _has_open_face_conflicts(_face_codes(solver)):
+        return False
+    return _supports_explicit_source_step(runtime, solver, resolved_source_terms)
+
+
+def _supports_cpml(runtime, solver, forward_state, resolved_source_terms) -> bool:
+    if not getattr(solver, "uses_cpml", False):
+        return False
+    if not _matches_checkpoint_layout(solver, forward_state):
+        return False
+    if has_complex_fields(solver):
+        return False
+    if getattr(solver, "dispersive_enabled", False):
+        return False
+    if getattr(solver, "tfsf_enabled", False):
+        return False
+    if _has_open_face_conflicts(_face_codes(solver)):
+        return False
+    return _supports_explicit_source_step(runtime, solver, resolved_source_terms)
+
+
+def _supports_dispersive(runtime, solver, forward_state, resolved_source_terms) -> bool:
+    if not getattr(solver, "dispersive_enabled", False):
+        return False
+    if has_complex_fields(solver):
+        return False
+    if not _matches_checkpoint_layout(solver, forward_state):
+        return False
+    if getattr(solver, "tfsf_enabled", False):
+        return False
+    if _has_open_face_conflicts(_face_codes(solver)):
+        return False
+    return _supports_explicit_source_step(runtime, solver, resolved_source_terms)
+
+
+def _supports_bloch(runtime, solver, forward_state, resolved_source_terms) -> bool:
+    if getattr(solver, "uses_cpml", False):
+        return False
+    if not has_complex_fields(solver):
+        return False
+    if not _matches_checkpoint_layout(solver, forward_state):
+        return False
+    if getattr(solver, "dispersive_enabled", False):
+        return False
+    if getattr(solver, "tfsf_enabled", False):
+        return False
+    if not all(code == BOUNDARY_BLOCH for code in _face_codes(solver)):
+        return False
+    return _supports_explicit_source_step(runtime, solver, resolved_source_terms)
+
+
+def _select_reverse_backend(
+    solver,
+    forward_state,
+    *,
+    eps_ex,
+    eps_ey,
+    eps_ez,
+    resolved_source_terms,
+) -> _ReverseBackend:
+    runtime = _runtime()
+    use_cuda = _cuda_reverse_step_available(eps_ex)
+
+    supports_tfsf = _supports_tfsf(runtime, solver, forward_state, resolved_source_terms)
+    supports_cpml = _supports_cpml(runtime, solver, forward_state, resolved_source_terms)
+    supports_standard = _supports_standard(runtime, solver, forward_state, resolved_source_terms)
+    supports_dispersive = _supports_dispersive(runtime, solver, forward_state, resolved_source_terms)
+    supports_bloch = _supports_bloch(runtime, solver, forward_state, resolved_source_terms)
+
+    decision_table = (
+        (_ReverseBackend.TFSF, supports_tfsf),
+        (_ReverseBackend.SLANG_CPML, supports_cpml and use_cuda),
+        (_ReverseBackend.SLANG_STANDARD, supports_standard and use_cuda),
+        (_ReverseBackend.SLANG_DISPERSIVE, supports_dispersive and use_cuda),
+        (_ReverseBackend.SLANG_BLOCH, supports_bloch and use_cuda),
+        (_ReverseBackend.PYTHON_BLOCH, supports_bloch),
+        (_ReverseBackend.PYTHON_DISPERSIVE, supports_dispersive),
+        (_ReverseBackend.PYTHON_STANDARD, supports_standard),
+        (_ReverseBackend.PYTHON_CPML, supports_cpml),
+        (_ReverseBackend.TORCH_VJP, True),
+    )
+    for backend, enabled in decision_table:
+        if enabled:
+            return backend
+    raise RuntimeError("Reverse backend decision table did not produce a backend.")
+
+
+def _accumulate_source_term_gradients(
+    runtime,
+    step_result,
+    *,
+    solver,
+    adjoint_state,
+    time_value,
+    eps_ex,
+    eps_ey,
+    eps_ez,
+    resolved_source_terms,
+):
+    return runtime._accumulate_source_term_gradients(
+        step_result,
+        solver=solver,
+        adjoint_state=adjoint_state,
+        time_value=time_value,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+        resolved_source_terms=resolved_source_terms,
+    )
+
+
+def reverse_step(
+    solver,
+    forward_state,
+    adjoint_state,
+    *,
+    time_value,
+    eps_ex,
+    eps_ey,
+    eps_ez,
+    profiler=None,
+):
+    runtime = _runtime()
+    from . import reference as _adjoint_reference
+
+    state_names = tuple(forward_state.keys())
+    if tuple(adjoint_state.keys()) != state_names:
+        raise RuntimeError(
+            "Reverse step expects forward and adjoint states to share the same frozen checkpoint layout."
+        )
+
+    resolved_source_terms = runtime._resolved_source_term_lists(solver, eps_ex, eps_ey, eps_ez)
+    backend = _select_reverse_backend(
+        solver,
+        forward_state,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+        resolved_source_terms=resolved_source_terms,
+    )
+
+    def finish(step_result):
+        return _accumulate_source_term_gradients(
+            runtime,
+            step_result,
+            solver=solver,
+            adjoint_state=adjoint_state,
+            time_value=time_value,
+            eps_ex=eps_ex,
+            eps_ey=eps_ey,
+            eps_ez=eps_ez,
+            resolved_source_terms=resolved_source_terms,
+        )
+
+    if backend is _ReverseBackend.TFSF:
+        return _adjoint_reference.reverse_step_tfsf(
+            solver,
+            forward_state,
+            adjoint_state,
+            time_value=time_value,
+            eps_ex=eps_ex,
+            eps_ey=eps_ey,
+            eps_ez=eps_ez,
+            resolved_source_terms=resolved_source_terms,
+            profiler=profiler,
+        )
+    if backend is _ReverseBackend.SLANG_CPML:
+        return finish(
+            runtime._reverse_step_cpml_slang(
+                solver,
+                forward_state,
+                adjoint_state,
+                time_value=time_value,
+                eps_ex=eps_ex,
+                eps_ey=eps_ey,
+                eps_ez=eps_ez,
+                resolved_source_terms=resolved_source_terms,
+                profiler=profiler,
+            )
+        )
+    if backend is _ReverseBackend.SLANG_STANDARD:
+        return finish(
+            runtime._reverse_step_standard_slang(
+                solver,
+                forward_state,
+                adjoint_state,
+                time_value=time_value,
+                eps_ex=eps_ex,
+                eps_ey=eps_ey,
+                eps_ez=eps_ez,
+                resolved_source_terms=resolved_source_terms,
+                profiler=profiler,
+            )
+        )
+    if backend is _ReverseBackend.SLANG_DISPERSIVE:
+        return finish(
+            runtime._reverse_step_dispersive_slang(
+                solver,
+                forward_state,
+                adjoint_state,
+                time_value=time_value,
+                eps_ex=eps_ex,
+                eps_ey=eps_ey,
+                eps_ez=eps_ez,
+                resolved_source_terms=resolved_source_terms,
+                profiler=profiler,
+            )
+        )
+    if backend is _ReverseBackend.SLANG_BLOCH:
+        return finish(
+            runtime._reverse_step_bloch_slang(
+                solver,
+                forward_state,
+                adjoint_state,
+                time_value=time_value,
+                eps_ex=eps_ex,
+                eps_ey=eps_ey,
+                eps_ez=eps_ez,
+                resolved_source_terms=resolved_source_terms,
+                profiler=profiler,
+            )
+        )
+    if backend is _ReverseBackend.PYTHON_BLOCH:
+        return finish(
+            _adjoint_reference.reverse_step_bloch_python_reference(
+                solver,
+                forward_state,
+                adjoint_state,
+                time_value=time_value,
+                eps_ex=eps_ex,
+                eps_ey=eps_ey,
+                eps_ez=eps_ez,
+                resolved_source_terms=resolved_source_terms,
+            )
+        )
+    if backend is _ReverseBackend.PYTHON_DISPERSIVE:
+        return finish(
+            _adjoint_reference.reverse_step_dispersive_python_reference(
+                solver,
+                forward_state,
+                adjoint_state,
+                time_value=time_value,
+                eps_ex=eps_ex,
+                eps_ey=eps_ey,
+                eps_ez=eps_ez,
+                resolved_source_terms=resolved_source_terms,
+            )
+        )
+    if backend is _ReverseBackend.PYTHON_STANDARD:
+        return finish(
+            _adjoint_reference.reverse_step_standard_python_reference(
+                solver,
+                forward_state,
+                adjoint_state,
+                time_value=time_value,
+                eps_ex=eps_ex,
+                eps_ey=eps_ey,
+                eps_ez=eps_ez,
+                resolved_source_terms=resolved_source_terms,
+            )
+        )
+    if backend is _ReverseBackend.PYTHON_CPML:
+        return finish(
+            _adjoint_reference.reverse_step_cpml_python_reference(
+                solver,
+                forward_state,
+                adjoint_state,
+                time_value=time_value,
+                eps_ex=eps_ex,
+                eps_ey=eps_ey,
+                eps_ez=eps_ez,
+                resolved_source_terms=resolved_source_terms,
+            )
+        )
+    if backend is _ReverseBackend.TORCH_VJP:
+        return _adjoint_reference.reverse_step_torch_vjp(
+            solver,
+            forward_state,
+            adjoint_state,
+            time_value=time_value,
+            eps_ex=eps_ex,
+            eps_ey=eps_ey,
+            eps_ez=eps_ez,
+            profiler=profiler,
+        )
+    raise RuntimeError(f"Unsupported reverse backend selection: {backend!r}")

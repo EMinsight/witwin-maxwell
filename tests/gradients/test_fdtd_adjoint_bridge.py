@@ -1,0 +1,2457 @@
+import math
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import witwin.maxwell as mw
+import witwin.maxwell.fdtd.adjoint as fdtd_adjoint
+from witwin.maxwell.fdtd.checkpoint import dispersive_state_name
+from witwin.maxwell.fdtd.adjoint import _FDTDGradientBridge, _replay_segment_states, reverse_step
+from witwin.maxwell.fdtd.boundary import BOUNDARY_BLOCH, BOUNDARY_NONE, BOUNDARY_PML
+from witwin.maxwell.fdtd.checkpoint import capture_checkpoint_state, checkpoint_schema
+from witwin.maxwell.fdtd.material_pullback import pullback_density_gradients
+from witwin.maxwell.scene import prepare_scene
+from tests.gradients import fdtd_adjoint_baselines as adjoint_baselines
+
+
+def _build_simulation(model, *, time_steps=24):
+    return mw.Simulation.fdtd(
+        model,
+        frequencies=[1e9],
+        run_time=mw.TimeConfig(time_steps=time_steps),
+        spectral_sampler=mw.SpectralSampler(window="none"),
+        full_field_dft=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("material", "message"),
+    [
+        (
+            mw.Material(eps_r=1.0, epsilon_tensor=mw.DiagonalTensor3(2.0, 3.0, 4.0)),
+            "anisotropic media",
+        ),
+        (
+            mw.Material(mu_lorentz_poles=(mw.LorentzPole(delta_eps=1.0, resonance_frequency=1.0e9, gamma=1.0e8),)),
+            "magnetic dispersive media",
+        ),
+        (
+            mw.Material(eps_r=2.0, kerr_chi3=1.0e-10),
+            "Kerr nonlinear media",
+        ),
+    ],
+)
+def test_fdtd_gradient_bridge_rejects_unsupported_medium_capabilities(material, message):
+    scene = mw.Scene(
+        domain=mw.Domain(bounds=((-0.5, 0.5), (-0.5, 0.5), (-0.5, 0.5))),
+        grid=mw.GridSpec.uniform(0.25),
+        device="cpu",
+    )
+    scene.add_structure(
+        mw.Structure(
+            geometry=mw.Box(position=(0.0, 0.0, 0.0), size=(0.5, 0.5, 0.5)),
+            material=material,
+        )
+    )
+
+    bridge = object.__new__(_FDTDGradientBridge)
+    with pytest.raises(NotImplementedError, match=message):
+        bridge._validate_supported_configuration(SimpleNamespace(scene=scene))
+
+
+def _fake_checkpoint_solver():
+    solver = SimpleNamespace(
+        complex_fields_enabled=True,
+        uses_cpml=True,
+        tfsf_enabled=True,
+        _tfsf_state={
+            "auxiliary_grid": SimpleNamespace(
+                electric=torch.arange(4, dtype=torch.float32),
+                magnetic=torch.arange(4, dtype=torch.float32) + 10.0,
+            )
+        },
+        dispersive_enabled=True,
+        _dispersive_templates={
+            "Ex": {
+                "debye": [{"polarization": torch.full((1,), 1.0), "current": torch.full((1,), 2.0)}],
+                "drude": [],
+                "lorentz": [],
+            },
+            "Ey": {
+                "debye": [],
+                "drude": [{"current": torch.full((1,), 3.0)}],
+                "lorentz": [],
+            },
+            "Ez": {
+                "debye": [],
+                "drude": [],
+                "lorentz": [{"polarization": torch.full((1,), 4.0), "current": torch.full((1,), 5.0)}],
+            },
+        },
+    )
+    for index, name in enumerate(
+        (
+            "Ex",
+            "Ey",
+            "Ez",
+            "Hx",
+            "Hy",
+            "Hz",
+            "Ex_imag",
+            "Ey_imag",
+            "Ez_imag",
+            "Hx_imag",
+            "Hy_imag",
+            "Hz_imag",
+            "psi_ex_y",
+            "psi_ex_z",
+            "psi_ey_x",
+            "psi_ey_z",
+            "psi_ez_x",
+            "psi_ez_y",
+            "psi_hx_y",
+            "psi_hx_z",
+            "psi_hy_x",
+            "psi_hy_z",
+            "psi_hz_x",
+            "psi_hz_y",
+        )
+    ):
+        setattr(solver, name, torch.full((2,), float(index + 1)))
+    return solver
+
+
+def _fake_standard_reverse_solver():
+    ex_shape = (2, 4, 5)
+    ey_shape = (3, 3, 5)
+    ez_shape = (3, 4, 4)
+    hx_shape = (3, 3, 4)
+    hy_shape = (2, 4, 4)
+    hz_shape = (2, 3, 5)
+    return SimpleNamespace(
+        uses_cpml=False,
+        complex_fields_enabled=False,
+        dispersive_enabled=False,
+        tfsf_enabled=False,
+        has_pec_faces=False,
+        boundary_x_low_code=BOUNDARY_NONE,
+        boundary_x_high_code=BOUNDARY_NONE,
+        boundary_y_low_code=BOUNDARY_NONE,
+        boundary_y_high_code=BOUNDARY_NONE,
+        boundary_z_low_code=BOUNDARY_NONE,
+        boundary_z_high_code=BOUNDARY_NONE,
+        inv_dx=1.25,
+        inv_dy=0.75,
+        inv_dz=1.5,
+        chx_decay=torch.full(hx_shape, 0.97),
+        chy_decay=torch.full(hy_shape, 0.96),
+        chz_decay=torch.full(hz_shape, 0.95),
+        chx_curl=torch.full(hx_shape, 0.11),
+        chy_curl=torch.full(hy_shape, 0.09),
+        chz_curl=torch.full(hz_shape, 0.07),
+        cex_decay=torch.full(ex_shape, 0.94),
+        cey_decay=torch.full(ey_shape, 0.93),
+        cez_decay=torch.full(ez_shape, 0.92),
+        cex_curl=torch.full(ex_shape, 0.13),
+        cey_curl=torch.full(ey_shape, 0.12),
+        cez_curl=torch.full(ez_shape, 0.10),
+        eps_Ex=torch.full(ex_shape, 2.0),
+        eps_Ey=torch.full(ey_shape, 2.5),
+        eps_Ez=torch.full(ez_shape, 3.0),
+        _source_time={"kind": "cw", "kind_code": 0, "amplitude": 0.0, "frequency": 1.0, "phase": 0.0, "delay": 0.0},
+        source_omega=2.0 * math.pi,
+        _compiled_source=None,
+        _source_terms=[],
+        _electric_source_terms=[],
+        _magnetic_source_terms=[],
+    )
+
+
+def _cpml_reverse_state_shapes():
+    ex_shape = (2, 4, 5)
+    ey_shape = (3, 3, 5)
+    ez_shape = (3, 4, 4)
+    hx_shape = (3, 3, 4)
+    hy_shape = (2, 4, 4)
+    hz_shape = (2, 3, 5)
+    return {
+        "Ex": ex_shape,
+        "Ey": ey_shape,
+        "Ez": ez_shape,
+        "Hx": hx_shape,
+        "Hy": hy_shape,
+        "Hz": hz_shape,
+        "psi_ex_y": ex_shape,
+        "psi_ex_z": ex_shape,
+        "psi_ey_x": ey_shape,
+        "psi_ey_z": ey_shape,
+        "psi_ez_x": ez_shape,
+        "psi_ez_y": ez_shape,
+        "psi_hx_y": hx_shape,
+        "psi_hx_z": hx_shape,
+        "psi_hy_x": hy_shape,
+        "psi_hy_z": hy_shape,
+        "psi_hz_x": hz_shape,
+        "psi_hz_y": hz_shape,
+    }
+
+
+def _fake_cpml_reverse_solver():
+    shapes = _cpml_reverse_state_shapes()
+    ex_shape = shapes["Ex"]
+    ey_shape = shapes["Ey"]
+    ez_shape = shapes["Ez"]
+    hx_shape = shapes["Hx"]
+    hy_shape = shapes["Hy"]
+    hz_shape = shapes["Hz"]
+    return SimpleNamespace(
+        uses_cpml=True,
+        complex_fields_enabled=False,
+        dispersive_enabled=False,
+        tfsf_enabled=False,
+        has_pec_faces=False,
+        boundary_x_low_code=BOUNDARY_PML,
+        boundary_x_high_code=BOUNDARY_PML,
+        boundary_y_low_code=BOUNDARY_PML,
+        boundary_y_high_code=BOUNDARY_PML,
+        boundary_z_low_code=BOUNDARY_PML,
+        boundary_z_high_code=BOUNDARY_PML,
+        inv_dx=1.25,
+        inv_dy=0.75,
+        inv_dz=1.5,
+        chx_decay=torch.full(hx_shape, 0.97),
+        chy_decay=torch.full(hy_shape, 0.96),
+        chz_decay=torch.full(hz_shape, 0.95),
+        chx_curl=torch.full(hx_shape, 0.11),
+        chy_curl=torch.full(hy_shape, 0.09),
+        chz_curl=torch.full(hz_shape, 0.07),
+        cex_decay=torch.full(ex_shape, 0.94),
+        cey_decay=torch.full(ey_shape, 0.93),
+        cez_decay=torch.full(ez_shape, 0.92),
+        cex_curl=torch.full(ex_shape, 0.13),
+        cey_curl=torch.full(ey_shape, 0.12),
+        cez_curl=torch.full(ez_shape, 0.10),
+        eps_Ex=torch.full(ex_shape, 2.0),
+        eps_Ey=torch.full(ey_shape, 2.5),
+        eps_Ez=torch.full(ez_shape, 3.0),
+        cpml_inv_kappa_h_x=torch.tensor([1.07, 1.03], dtype=torch.float32),
+        cpml_inv_kappa_h_y=torch.tensor([1.05, 1.02, 1.01], dtype=torch.float32),
+        cpml_inv_kappa_h_z=torch.tensor([1.08, 1.04, 1.02, 1.01], dtype=torch.float32),
+        cpml_b_h_x=torch.tensor([0.83, 0.81], dtype=torch.float32),
+        cpml_b_h_y=torch.tensor([0.85, 0.82, 0.80], dtype=torch.float32),
+        cpml_b_h_z=torch.tensor([0.84, 0.82, 0.80, 0.78], dtype=torch.float32),
+        cpml_c_h_x=torch.tensor([0.12, 0.10], dtype=torch.float32),
+        cpml_c_h_y=torch.tensor([0.11, 0.09, 0.08], dtype=torch.float32),
+        cpml_c_h_z=torch.tensor([0.13, 0.11, 0.09, 0.07], dtype=torch.float32),
+        cpml_inv_kappa_e_x=torch.tensor([1.06, 1.03, 1.01], dtype=torch.float32),
+        cpml_inv_kappa_e_y=torch.tensor([1.05, 1.04, 1.02, 1.01], dtype=torch.float32),
+        cpml_inv_kappa_e_z=torch.tensor([1.09, 1.06, 1.03, 1.02, 1.01], dtype=torch.float32),
+        cpml_b_e_x=torch.tensor([0.86, 0.83, 0.80], dtype=torch.float32),
+        cpml_b_e_y=torch.tensor([0.85, 0.83, 0.81, 0.79], dtype=torch.float32),
+        cpml_b_e_z=torch.tensor([0.87, 0.84, 0.82, 0.80, 0.78], dtype=torch.float32),
+        cpml_c_e_x=torch.tensor([0.08, 0.07, 0.06], dtype=torch.float32),
+        cpml_c_e_y=torch.tensor([0.09, 0.08, 0.07, 0.06], dtype=torch.float32),
+        cpml_c_e_z=torch.tensor([0.10, 0.09, 0.08, 0.07, 0.06], dtype=torch.float32),
+        _source_time={"kind": "cw", "kind_code": 0, "amplitude": 0.0, "frequency": 1.0, "phase": 0.0, "delay": 0.0},
+        source_omega=2.0 * math.pi,
+        _compiled_source=None,
+        _source_terms=[],
+        _electric_source_terms=[],
+        _magnetic_source_terms=[],
+    )
+
+
+def _dispersive_cpml_reverse_state_shapes():
+    shapes = dict(_cpml_reverse_state_shapes())
+    shapes[dispersive_state_name("Ex", "debye", 0, "polarization")] = shapes["Ex"]
+    shapes[dispersive_state_name("Ex", "debye", 0, "current")] = shapes["Ex"]
+    shapes[dispersive_state_name("Ey", "drude", 0, "current")] = shapes["Ey"]
+    shapes[dispersive_state_name("Ez", "lorentz", 0, "polarization")] = shapes["Ez"]
+    shapes[dispersive_state_name("Ez", "lorentz", 0, "current")] = shapes["Ez"]
+    return shapes
+
+
+def _fake_dispersive_cpml_reverse_solver():
+    base = _fake_cpml_reverse_solver()
+    values = dict(vars(base))
+    values["dispersive_enabled"] = True
+    values["dt"] = 0.05
+    values["_dispersive_templates"] = {
+        "Ex": {
+            "inv_eps": (1.0 / base.eps_Ex).contiguous(),
+            "debye": [
+                {
+                    "decay": 0.83,
+                    "drive": torch.full(base.eps_Ex.shape, 0.021, dtype=torch.float32),
+                }
+            ],
+            "drude": [],
+            "lorentz": [],
+        },
+        "Ey": {
+            "inv_eps": (1.0 / base.eps_Ey).contiguous(),
+            "debye": [],
+            "drude": [
+                {
+                    "decay": 0.79,
+                    "drive": torch.full(base.eps_Ey.shape, 0.018, dtype=torch.float32),
+                }
+            ],
+            "lorentz": [],
+        },
+        "Ez": {
+            "inv_eps": (1.0 / base.eps_Ez).contiguous(),
+            "debye": [],
+            "drude": [],
+            "lorentz": [
+                {
+                    "decay": 0.88,
+                    "restoring": 0.14,
+                    "drive": torch.full(base.eps_Ez.shape, 0.024, dtype=torch.float32),
+                }
+            ],
+        },
+    }
+    return SimpleNamespace(**values)
+
+
+def _tfsf_cpml_reverse_state_shapes():
+    shapes = dict(_cpml_reverse_state_shapes())
+    shapes["tfsf_aux_electric"] = (5,)
+    shapes["tfsf_aux_magnetic"] = (4,)
+    return shapes
+
+
+def _fake_tfsf_cpml_reverse_solver(provider: str = "plane_wave_ref_x_ez"):
+    base = _fake_cpml_reverse_solver()
+    values = dict(vars(base))
+    values["tfsf_enabled"] = True
+    values["dt"] = 0.05
+    values["_source_time"] = {
+        "kind": "gaussian",
+        "kind_code": 1,
+        "amplitude": 1.3,
+        "frequency": 0.75,
+        "fwidth": 0.25,
+        "phase": 0.1,
+        "delay": 0.0,
+    }
+
+    if provider == "analytic_profile":
+        values["_tfsf_state"] = {
+            "provider": "analytic_profile",
+            "bounds": ((0.0, 0.1), (0.0, 0.1), (0.0, 0.1)),
+            "lower": (1, 1, 1),
+            "upper": (2, 2, 2),
+            "electric_terms": [
+                {
+                    "field_name": "Ez",
+                    "offsets": (1, 1, 1),
+                    "patch": torch.full((1, 1, 1), 0.14, dtype=torch.float32),
+                    "grid": None,
+                    "phase_real": 1.0,
+                    "phase_imag": 0.0,
+                    "delay_patch": torch.full((1, 1, 1), 0.01, dtype=torch.float32),
+                    "activation_delay_patch": None,
+                    "cw_cos_patch": None,
+                    "cw_sin_patch": None,
+                }
+            ],
+            "magnetic_terms": [
+                {
+                    "field_name": "Hy",
+                    "offsets": (0, 1, 1),
+                    "patch": torch.full((1, 1, 1), -0.09, dtype=torch.float32),
+                    "grid": None,
+                    "phase_real": 1.0,
+                    "phase_imag": 0.0,
+                    "delay_patch": torch.full((1, 1, 1), 0.02, dtype=torch.float32),
+                    "activation_delay_patch": torch.zeros((1, 1, 1), dtype=torch.float32),
+                    "cw_cos_patch": None,
+                    "cw_sin_patch": None,
+                }
+            ],
+        }
+        return SimpleNamespace(**values)
+
+    auxiliary_grid = SimpleNamespace(
+        s_min=-0.2,
+        ds=0.1,
+        electric_decay=torch.tensor([0.95, 0.93, 0.91, 0.89, 0.87], dtype=torch.float32),
+        electric_curl=torch.tensor([0.02, 0.03, 0.04, 0.05, 0.06], dtype=torch.float32),
+        magnetic_decay=torch.tensor([0.96, 0.94, 0.92, 0.90], dtype=torch.float32),
+        magnetic_curl=torch.tensor([0.03, 0.04, 0.05, 0.06], dtype=torch.float32),
+        source_index=2,
+        source_time=values["_source_time"],
+    )
+    if provider == "plane_wave_aux":
+        electric_terms = [
+            {
+                "field_name": "Ez",
+                "offsets": (1, 1, 1),
+                "grid": None,
+                "coeff_patch": torch.full((1, 1, 1), 0.18, dtype=torch.float32),
+                "work_patch": torch.zeros((1, 1, 1), dtype=torch.float32),
+                "sample_positions": torch.full((1, 1, 1), -0.05, dtype=torch.float32),
+                "component_scale": 0.7,
+            }
+        ]
+        magnetic_terms = [
+            {
+                "field_name": "Hy",
+                "offsets": (0, 1, 1),
+                "grid": None,
+                "coeff_patch": torch.full((1, 1, 1), -0.11, dtype=torch.float32),
+                "work_patch": torch.zeros((1, 1, 1), dtype=torch.float32),
+                "sample_positions": torch.full((1, 1, 1), 0.05, dtype=torch.float32),
+                "component_scale": 1.2,
+            }
+        ]
+    else:
+        electric_terms = [
+            {
+                "field_name": "Ez",
+                "offsets": (1, 1, 1),
+                "grid": None,
+                "coeff_patch": torch.full((1, 1, 1), 0.18, dtype=torch.float32),
+                "work_patch": torch.zeros((1, 1, 1), dtype=torch.float32),
+                "sample_kind": "magnetic",
+                "sample_indices": torch.tensor([1], dtype=torch.int64),
+                "scalar_sample_index": 1,
+                "sample_view": (1, 1, 1),
+                "component_scale": 0.7,
+            }
+        ]
+        magnetic_terms = [
+            {
+                "field_name": "Hy",
+                "offsets": (0, 1, 1),
+                "grid": None,
+                "coeff_patch": torch.full((1, 1, 1), -0.11, dtype=torch.float32),
+                "work_patch": torch.zeros((1, 1, 1), dtype=torch.float32),
+                "sample_kind": "electric",
+                "sample_indices": torch.tensor([2], dtype=torch.int64),
+                "scalar_sample_index": 2,
+                "sample_view": (1, 1, 1),
+                "component_scale": 1.2,
+            }
+        ]
+    values["_tfsf_state"] = {
+        "provider": provider,
+        "bounds": ((0.0, 0.1), (0.0, 0.1), (0.0, 0.1)),
+        "lower": (1, 1, 1),
+        "upper": (2, 2, 2),
+        "auxiliary_grid": auxiliary_grid,
+        "electric_terms": electric_terms,
+        "magnetic_terms": magnetic_terms,
+    }
+    return SimpleNamespace(**values)
+
+
+def _bloch_reverse_state_shapes():
+    shapes = _cpml_reverse_state_shapes()
+    return {
+        "Ex": shapes["Ex"],
+        "Ey": shapes["Ey"],
+        "Ez": shapes["Ez"],
+        "Hx": shapes["Hx"],
+        "Hy": shapes["Hy"],
+        "Hz": shapes["Hz"],
+        "Ex_imag": shapes["Ex"],
+        "Ey_imag": shapes["Ey"],
+        "Ez_imag": shapes["Ez"],
+        "Hx_imag": shapes["Hx"],
+        "Hy_imag": shapes["Hy"],
+        "Hz_imag": shapes["Hz"],
+    }
+
+
+def _fake_bloch_reverse_solver():
+    shapes = _bloch_reverse_state_shapes()
+    phase_x = 0.37
+    phase_y = -0.21
+    phase_z = 0.19
+    return SimpleNamespace(
+        uses_cpml=False,
+        complex_fields_enabled=True,
+        boundary_kind="bloch",
+        dispersive_enabled=False,
+        tfsf_enabled=False,
+        has_pec_faces=False,
+        boundary_x_low_code=BOUNDARY_BLOCH,
+        boundary_x_high_code=BOUNDARY_BLOCH,
+        boundary_y_low_code=BOUNDARY_BLOCH,
+        boundary_y_high_code=BOUNDARY_BLOCH,
+        boundary_z_low_code=BOUNDARY_BLOCH,
+        boundary_z_high_code=BOUNDARY_BLOCH,
+        boundary_phase_cos=torch.tensor(
+            [math.cos(phase_x), math.cos(phase_y), math.cos(phase_z)],
+            dtype=torch.float32,
+        ),
+        boundary_phase_sin=torch.tensor(
+            [math.sin(phase_x), math.sin(phase_y), math.sin(phase_z)],
+            dtype=torch.float32,
+        ),
+        inv_dx=1.25,
+        inv_dy=0.75,
+        inv_dz=1.5,
+        chx_decay=torch.full(shapes["Hx"], 0.97),
+        chy_decay=torch.full(shapes["Hy"], 0.96),
+        chz_decay=torch.full(shapes["Hz"], 0.95),
+        chx_curl=torch.full(shapes["Hx"], 0.11),
+        chy_curl=torch.full(shapes["Hy"], 0.09),
+        chz_curl=torch.full(shapes["Hz"], 0.07),
+        cex_decay=torch.full(shapes["Ex"], 0.94),
+        cey_decay=torch.full(shapes["Ey"], 0.93),
+        cez_decay=torch.full(shapes["Ez"], 0.92),
+        cex_curl=torch.full(shapes["Ex"], 0.13),
+        cey_curl=torch.full(shapes["Ey"], 0.12),
+        cez_curl=torch.full(shapes["Ez"], 0.10),
+        eps_Ex=torch.full(shapes["Ex"], 2.0),
+        eps_Ey=torch.full(shapes["Ey"], 2.5),
+        eps_Ez=torch.full(shapes["Ez"], 3.0),
+        _source_time={"kind": "cw", "kind_code": 0, "amplitude": 0.0, "frequency": 1.0, "phase": 0.0, "delay": 0.0},
+        source_omega=2.0 * math.pi,
+        _compiled_source=None,
+        _source_terms=[],
+        _electric_source_terms=[],
+        _magnetic_source_terms=[],
+    )
+
+
+def _move_solver_tensors_to_cuda(solver):
+    def _move(value):
+        if torch.is_tensor(value):
+            return value.to(device="cuda")
+        if isinstance(value, SimpleNamespace):
+            return SimpleNamespace(**{key: _move(item) for key, item in vars(value).items()})
+        if isinstance(value, dict):
+            return {key: _move(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_move(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_move(item) for item in value)
+        return value
+
+    values = {}
+    for name, value in vars(solver).items():
+        values[name] = _move(value)
+    values["device"] = "cuda"
+    values["kernel_block_size"] = (256, 1, 1)
+    return SimpleNamespace(**values)
+
+
+def test_capture_checkpoint_state_freezes_schema_layout():
+    state = capture_checkpoint_state(_fake_checkpoint_solver(), step=3)
+
+    assert state.step == 3
+    assert state.schema.version == 1
+    assert tuple(state.tensors.keys()) == state.schema.state_names
+    assert state.schema.field_names == ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz")
+    assert state.schema.complex_field_names == (
+        "Ex_imag",
+        "Ey_imag",
+        "Ez_imag",
+        "Hx_imag",
+        "Hy_imag",
+        "Hz_imag",
+    )
+    assert state.schema.cpml_state_names == (
+        "psi_ex_y",
+        "psi_ex_z",
+        "psi_ey_x",
+        "psi_ey_z",
+        "psi_ez_x",
+        "psi_ez_y",
+        "psi_hx_y",
+        "psi_hx_z",
+        "psi_hy_x",
+        "psi_hy_z",
+        "psi_hz_x",
+        "psi_hz_y",
+    )
+    assert state.schema.tfsf_auxiliary_state_names == (
+        "tfsf_aux_electric",
+        "tfsf_aux_magnetic",
+    )
+    assert state.schema.dispersive_state_names == (
+        dispersive_state_name("Ex", "debye", 0, "polarization"),
+        dispersive_state_name("Ex", "debye", 0, "current"),
+        dispersive_state_name("Ey", "drude", 0, "current"),
+        dispersive_state_name("Ez", "lorentz", 0, "polarization"),
+        dispersive_state_name("Ez", "lorentz", 0, "current"),
+    )
+
+
+def test_reverse_step_shell_matches_inline_torch_vjp(monkeypatch):
+    def fake_step_state(_solver, state, *, time_value, eps_ex, eps_ey, eps_ez):
+        del _solver
+        return {
+            "Ex": 2.0 * state["Ex"] - state["Ey"] + (1.0 + time_value) * eps_ex,
+            "Ey": 0.5 * state["Ex"] + 3.0 * state["Ey"] + eps_ey,
+            "Hz": state["Hz"] - 1.5 * state["Ex"] + 0.25 * eps_ez,
+        }
+
+    monkeypatch.setattr(fdtd_adjoint, "_step_state", fake_step_state)
+
+    solver = SimpleNamespace()
+    forward_state = {
+        "Ex": torch.tensor([1.0, -2.0], dtype=torch.float32),
+        "Ey": torch.tensor([0.5, 3.0], dtype=torch.float32),
+        "Hz": torch.tensor([-1.0, 2.5], dtype=torch.float32),
+    }
+    adjoint_state = {
+        "Ex": torch.tensor([0.25, -0.5], dtype=torch.float32),
+        "Ey": torch.tensor([1.5, 0.75], dtype=torch.float32),
+        "Hz": torch.tensor([-0.2, 0.4], dtype=torch.float32),
+    }
+    eps_ex = torch.tensor([0.1, -0.3], dtype=torch.float32, requires_grad=True)
+    eps_ey = torch.tensor([0.6, 0.2], dtype=torch.float32, requires_grad=True)
+    eps_ez = torch.tensor([-0.4, 0.8], dtype=torch.float32, requires_grad=True)
+
+    result = reverse_step(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.25,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    with torch.enable_grad():
+        state_inputs = {
+            name: tensor.detach().clone().requires_grad_(True)
+            for name, tensor in forward_state.items()
+        }
+        next_state = fake_step_state(
+            solver,
+            state_inputs,
+            time_value=0.25,
+            eps_ex=eps_ex,
+            eps_ey=eps_ey,
+            eps_ez=eps_ez,
+        )
+        objective = torch.zeros((), dtype=torch.float32)
+        for name in forward_state:
+            objective = objective + torch.sum(next_state[name] * adjoint_state[name])
+        gradients = torch.autograd.grad(
+            objective,
+            tuple(state_inputs.values()) + (eps_ex, eps_ey, eps_ez),
+            allow_unused=True,
+        )
+
+    expected_pre_step = {
+        name: gradient.detach()
+        for (name, _), gradient in zip(state_inputs.items(), gradients[: len(state_inputs)])
+    }
+    assert torch.allclose(result.pre_step_adjoint["Ex"], expected_pre_step["Ex"])
+    assert torch.allclose(result.pre_step_adjoint["Ey"], expected_pre_step["Ey"])
+    assert torch.allclose(result.pre_step_adjoint["Hz"], expected_pre_step["Hz"])
+    assert torch.allclose(result.grad_eps_ex, gradients[-3].detach())
+    assert torch.allclose(result.grad_eps_ey, gradients[-2].detach())
+    assert torch.allclose(result.grad_eps_ez, gradients[-1].detach())
+    assert result.backend == "torch_vjp"
+
+
+def test_reverse_step_standard_python_reference_matches_torch_vjp():
+    torch.manual_seed(7)
+    solver = _fake_standard_reverse_solver()
+    forward_state = {
+        "Ex": torch.randn(2, 4, 5, dtype=torch.float32),
+        "Ey": torch.randn(3, 3, 5, dtype=torch.float32),
+        "Ez": torch.randn(3, 4, 4, dtype=torch.float32),
+        "Hx": torch.randn(3, 3, 4, dtype=torch.float32),
+        "Hy": torch.randn(2, 4, 4, dtype=torch.float32),
+        "Hz": torch.randn(2, 3, 5, dtype=torch.float32),
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    reference = adjoint_baselines.reverse_step_standard_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_torch_vjp(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert reference.backend == "python_reference_standard"
+    assert expected.backend == "torch_vjp"
+    for name in forward_state:
+        assert torch.allclose(reference.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+def test_reverse_step_cpml_python_reference_matches_torch_vjp():
+    torch.manual_seed(13)
+    solver = _fake_cpml_reverse_solver()
+    state_shapes = _cpml_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    reference = adjoint_baselines.reverse_step_cpml_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_torch_vjp(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert reference.backend == "python_reference_cpml"
+    assert expected.backend == "torch_vjp"
+    for name in forward_state:
+        assert torch.allclose(reference.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+def test_reverse_step_bloch_python_reference_matches_torch_vjp():
+    torch.manual_seed(23)
+    solver = _fake_bloch_reverse_solver()
+    state_shapes = _bloch_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    reference = adjoint_baselines.reverse_step_bloch_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_torch_vjp(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert reference.backend == "python_reference_bloch"
+    assert expected.backend == "torch_vjp"
+    for name in forward_state:
+        assert torch.allclose(reference.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+def test_reverse_step_bloch_python_reference_matches_torch_vjp_with_source_terms():
+    torch.manual_seed(29)
+    solver = _fake_bloch_reverse_solver()
+    solver._source_terms = [
+        {
+            "field_name": "Ez",
+            "offsets": (0, 0, 1),
+            "patch": torch.tensor([[[0.25, -0.4]]], dtype=torch.float32),
+            "phase_real": 0.6,
+            "phase_imag": -0.35,
+            "cw_cos_patch": None,
+            "cw_sin_patch": None,
+            "delay_patch": None,
+            "activation_delay_patch": None,
+        }
+    ]
+    state_shapes = _bloch_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    reference = adjoint_baselines.reverse_step_bloch_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.125,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_torch_vjp(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.125,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert reference.backend == "python_reference_bloch"
+    for name in forward_state:
+        assert torch.allclose(reference.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+def test_reverse_step_dispersive_python_reference_matches_torch_vjp():
+    torch.manual_seed(41)
+    solver = _fake_dispersive_cpml_reverse_solver()
+    state_shapes = _dispersive_cpml_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    reference = adjoint_baselines.reverse_step_dispersive_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_torch_vjp(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert reference.backend == "python_reference_dispersive_cpml"
+    assert expected.backend == "torch_vjp"
+    for name in forward_state:
+        assert torch.allclose(reference.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+def test_reverse_step_dispersive_python_reference_matches_torch_vjp_with_source_terms():
+    torch.manual_seed(43)
+    solver = _fake_dispersive_cpml_reverse_solver()
+    solver._source_terms = [
+        {
+            "field_name": "Ez",
+            "offsets": (0, 0, 1),
+            "patch": torch.tensor([[[0.2, -0.15]]], dtype=torch.float32),
+            "phase_real": 0.55,
+            "phase_imag": 0.0,
+            "cw_cos_patch": None,
+            "cw_sin_patch": None,
+            "delay_patch": None,
+            "activation_delay_patch": None,
+        }
+    ]
+    state_shapes = _dispersive_cpml_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    reference = adjoint_baselines.reverse_step_dispersive_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.125,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_torch_vjp(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.125,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert reference.backend == "python_reference_dispersive_cpml"
+    for name in forward_state:
+        assert torch.allclose(reference.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+def test_reverse_step_tfsf_python_reference_matches_torch_vjp():
+    torch.manual_seed(59)
+    solver = _fake_tfsf_cpml_reverse_solver()
+    state_shapes = _tfsf_cpml_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    reference = adjoint_baselines.reverse_step_tfsf_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.075,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_torch_vjp(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.075,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert reference.backend == "python_reference_tfsf_cpml"
+    for name in forward_state:
+        assert torch.allclose(reference.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+def test_reverse_step_tfsf_python_reference_matches_torch_vjp_without_auxiliary_grid():
+    torch.manual_seed(61)
+    solver = _fake_tfsf_cpml_reverse_solver(provider="analytic_profile")
+    state_shapes = _cpml_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    reference = adjoint_baselines.reverse_step_tfsf_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.05,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_torch_vjp(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.05,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert reference.backend == "python_reference_tfsf_cpml"
+    for name in forward_state:
+        assert torch.allclose(reference.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(reference.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang reverse kernels")
+@pytest.mark.parametrize("provider", ["plane_wave_ref_x_ez", "plane_wave_aux"])
+def test_reverse_step_tfsf_slang_matches_python_reference(provider):
+    torch.manual_seed(67)
+    cpu_solver = _fake_tfsf_cpml_reverse_solver(provider=provider)
+    cuda_solver = _move_solver_tensors_to_cuda(_fake_tfsf_cpml_reverse_solver(provider=provider))
+    state_shapes = _tfsf_cpml_reverse_state_shapes()
+    cpu_forward_state = {
+        name: torch.randn(state_shapes[name], dtype=torch.float32)
+        for name in checkpoint_schema(cpu_solver).state_names
+    }
+    cpu_adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in cpu_forward_state.items()
+    }
+    cuda_forward_state = {
+        name: tensor.to(device="cuda")
+        for name, tensor in cpu_forward_state.items()
+    }
+    frozen_forward_state = {
+        name: tensor.clone()
+        for name, tensor in cuda_forward_state.items()
+    }
+    cuda_adjoint_state = {
+        name: tensor.to(device="cuda")
+        for name, tensor in cpu_adjoint_state.items()
+    }
+    cpu_eps_ex = torch.full_like(cpu_forward_state["Ex"], 2.3, requires_grad=True)
+    cpu_eps_ey = torch.full_like(cpu_forward_state["Ey"], 2.7, requires_grad=True)
+    cpu_eps_ez = torch.full_like(cpu_forward_state["Ez"], 3.1, requires_grad=True)
+    cuda_eps_ex = cpu_eps_ex.detach().to(device="cuda").requires_grad_(True)
+    cuda_eps_ey = cpu_eps_ey.detach().to(device="cuda").requires_grad_(True)
+    cuda_eps_ez = cpu_eps_ez.detach().to(device="cuda").requires_grad_(True)
+
+    actual = reverse_step(
+        cuda_solver,
+        cuda_forward_state,
+        cuda_adjoint_state,
+        time_value=0.075,
+        eps_ex=cuda_eps_ex,
+        eps_ey=cuda_eps_ey,
+        eps_ez=cuda_eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_tfsf_python_reference(
+        cpu_solver,
+        cpu_forward_state,
+        cpu_adjoint_state,
+        time_value=0.075,
+        eps_ex=cpu_eps_ex,
+        eps_ey=cpu_eps_ey,
+        eps_ez=cpu_eps_ez,
+    )
+
+    assert actual.backend == "slang_tfsf_cpml"
+    assert expected.backend == "python_reference_tfsf_cpml"
+    for name in cuda_forward_state:
+        assert torch.equal(cuda_forward_state[name], frozen_forward_state[name])
+    for name in cpu_forward_state:
+        assert torch.allclose(actual.pre_step_adjoint[name].cpu(), expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ex.cpu(), expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ey.cpu(), expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ez.cpu(), expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang reverse kernels")
+def test_reverse_step_bloch_slang_matches_python_reference():
+    torch.manual_seed(31)
+    solver = _move_solver_tensors_to_cuda(_fake_bloch_reverse_solver())
+    state_shapes = _bloch_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], device="cuda", dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    frozen_forward_state = {
+        name: tensor.clone()
+        for name, tensor in forward_state.items()
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    actual = reverse_step(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_bloch_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert actual.backend == "slang_bloch"
+    assert expected.backend == "python_reference_bloch"
+    for name in forward_state:
+        assert torch.equal(forward_state[name], frozen_forward_state[name])
+    for name in forward_state:
+        assert torch.allclose(actual.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang reverse kernels")
+def test_reverse_step_bloch_slang_matches_python_reference_with_source_terms():
+    torch.manual_seed(37)
+    solver = _move_solver_tensors_to_cuda(_fake_bloch_reverse_solver())
+    solver._source_terms = [
+        {
+            "field_name": "Ez",
+            "offsets": (0, 0, 1),
+            "patch": torch.tensor([[[0.25, -0.4]]], device="cuda", dtype=torch.float32),
+            "phase_real": 0.6,
+            "phase_imag": -0.35,
+            "cw_cos_patch": None,
+            "cw_sin_patch": None,
+            "delay_patch": None,
+            "activation_delay_patch": None,
+        }
+    ]
+    state_shapes = _bloch_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], device="cuda", dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    actual = reverse_step(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.125,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_bloch_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.125,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+        resolved_source_terms=adjoint_baselines.resolved_source_term_lists(solver, eps_ex, eps_ey, eps_ez),
+    )
+    expected = adjoint_baselines.accumulate_source_term_gradients(
+        expected,
+        solver=solver,
+        adjoint_state=adjoint_state,
+        time_value=0.125,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+        resolved_source_terms=adjoint_baselines.resolved_source_term_lists(solver, eps_ex, eps_ey, eps_ez),
+    )
+
+    assert actual.backend == "slang_bloch"
+    for name in forward_state:
+        assert torch.allclose(actual.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang reverse kernels")
+def test_reverse_step_dispersive_slang_matches_python_reference():
+    torch.manual_seed(47)
+    solver = _move_solver_tensors_to_cuda(_fake_dispersive_cpml_reverse_solver())
+    state_shapes = _dispersive_cpml_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], device="cuda", dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    frozen_forward_state = {
+        name: tensor.clone()
+        for name, tensor in forward_state.items()
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    actual = reverse_step(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_dispersive_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+        resolved_source_terms=adjoint_baselines.resolved_source_term_lists(solver, eps_ex, eps_ey, eps_ez),
+    )
+
+    assert actual.backend == "slang_dispersive_cpml"
+    assert expected.backend == "python_reference_dispersive_cpml"
+    for name in forward_state:
+        assert torch.equal(forward_state[name], frozen_forward_state[name])
+    for name in forward_state:
+        assert torch.allclose(actual.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang reverse kernels")
+def test_reverse_step_dispersive_slang_matches_python_reference_with_source_terms():
+    torch.manual_seed(53)
+    solver = _move_solver_tensors_to_cuda(_fake_dispersive_cpml_reverse_solver())
+    solver._source_terms = [
+        {
+            "field_name": "Ez",
+            "offsets": (0, 0, 1),
+            "patch": torch.tensor([[[0.2, -0.15]]], device="cuda", dtype=torch.float32),
+            "phase_real": 0.55,
+            "phase_imag": 0.0,
+            "cw_cos_patch": None,
+            "cw_sin_patch": None,
+            "delay_patch": None,
+            "activation_delay_patch": None,
+        }
+    ]
+    state_shapes = _dispersive_cpml_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], device="cuda", dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+    resolved_source_terms = adjoint_baselines.resolved_source_term_lists(solver, eps_ex, eps_ey, eps_ez)
+
+    actual = reverse_step(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.125,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_dispersive_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.125,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+        resolved_source_terms=resolved_source_terms,
+    )
+    expected = adjoint_baselines.accumulate_source_term_gradients(
+        expected,
+        solver=solver,
+        adjoint_state=adjoint_state,
+        time_value=0.125,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+        resolved_source_terms=resolved_source_terms,
+    )
+
+    assert actual.backend == "slang_dispersive_cpml"
+    for name in forward_state:
+        assert torch.allclose(actual.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang reverse kernels")
+def test_reverse_step_standard_slang_matches_python_reference():
+    torch.manual_seed(11)
+    solver = _move_solver_tensors_to_cuda(_fake_standard_reverse_solver())
+    forward_state = {
+        "Ex": torch.randn(2, 4, 5, device="cuda", dtype=torch.float32),
+        "Ey": torch.randn(3, 3, 5, device="cuda", dtype=torch.float32),
+        "Ez": torch.randn(3, 4, 4, device="cuda", dtype=torch.float32),
+        "Hx": torch.randn(3, 3, 4, device="cuda", dtype=torch.float32),
+        "Hy": torch.randn(2, 4, 4, device="cuda", dtype=torch.float32),
+        "Hz": torch.randn(2, 3, 5, device="cuda", dtype=torch.float32),
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    actual = reverse_step(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_standard_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert actual.backend == "slang_standard"
+    assert expected.backend == "python_reference_standard"
+    for name in forward_state:
+        assert torch.allclose(actual.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang reverse kernels")
+def test_reverse_step_cpml_slang_matches_python_reference():
+    torch.manual_seed(17)
+    solver = _move_solver_tensors_to_cuda(_fake_cpml_reverse_solver())
+    state_shapes = _cpml_reverse_state_shapes()
+    forward_state = {
+        name: torch.randn(state_shapes[name], device="cuda", dtype=torch.float32)
+        for name in checkpoint_schema(solver).state_names
+    }
+    frozen_forward_state = {
+        name: tensor.clone()
+        for name, tensor in forward_state.items()
+    }
+    adjoint_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in forward_state.items()
+    }
+    eps_ex = torch.full_like(forward_state["Ex"], 2.3, requires_grad=True)
+    eps_ey = torch.full_like(forward_state["Ey"], 2.7, requires_grad=True)
+    eps_ez = torch.full_like(forward_state["Ez"], 3.1, requires_grad=True)
+
+    actual = reverse_step(
+        solver,
+        forward_state,
+        adjoint_state,
+        time_value=0.0,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+    expected = adjoint_baselines.reverse_step_cpml_python_reference(
+        solver,
+        forward_state,
+        adjoint_state,
+        eps_ex=eps_ex,
+        eps_ey=eps_ey,
+        eps_ez=eps_ez,
+    )
+
+    assert actual.backend == "slang_cpml"
+    assert expected.backend == "python_reference_cpml"
+    for name in forward_state:
+        assert torch.equal(forward_state[name], frozen_forward_state[name])
+    for name in forward_state:
+        assert torch.allclose(actual.pre_step_adjoint[name], expected.pre_step_adjoint[name], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ex, expected.grad_eps_ex, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ey, expected.grad_eps_ey, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(actual.grad_eps_ez, expected.grad_eps_ez, rtol=1e-5, atol=1e-6)
+
+
+def _build_material_pullback_scene(device: str):
+    density_a = torch.tensor(
+        [
+            [[-0.4, 0.2], [0.7, 1.1]],
+            [[0.0, 0.8], [1.3, -0.2]],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    density_b = torch.tensor(
+        [
+            [[0.1, 0.6]],
+            [[0.9, 1.2]],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    scene = mw.Scene(
+        domain=mw.Domain(bounds=((0.0, 0.5), (0.0, 0.4), (0.0, 0.4))),
+        grid=mw.GridSpec.uniform(0.1),
+        boundary=mw.BoundarySpec.none(),
+        device=device,
+    )
+    scene.add_material_region(
+        mw.MaterialRegion(
+            name="region_a",
+            geometry=mw.Box(position=(0.2, 0.15, 0.15), size=(0.3, 0.3, 0.3)),
+            density=density_a,
+            bounds=(-0.5, 1.5),
+            eps_bounds=(1.0, 4.5),
+            mu_bounds=(1.0, 1.0),
+            filter_radius=0.12,
+            projection_beta=5.0,
+        )
+    )
+    scene.add_material_region(
+        mw.MaterialRegion(
+            name="region_b",
+            geometry=mw.Box(position=(0.3, 0.15, 0.15), size=(0.2, 0.2, 0.2)),
+            density=density_b,
+            eps_bounds=(1.5, 5.0),
+            mu_bounds=(1.0, 1.0),
+            filter_radius=0.16,
+            projection_beta=4.0,
+        )
+    )
+    return scene, (density_a, density_b)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+    ],
+)
+def test_material_pullback_explicit_matches_autograd_baseline(device):
+    torch.manual_seed(101)
+    scene, density_tensors = _build_material_pullback_scene(device)
+    prepared_scene = prepare_scene(scene)
+    grad_eps_ex = torch.randn((prepared_scene.Nx - 1, prepared_scene.Ny, prepared_scene.Nz), device=device, dtype=torch.float32)
+    grad_eps_ey = torch.randn((prepared_scene.Nx, prepared_scene.Ny - 1, prepared_scene.Nz), device=device, dtype=torch.float32)
+    grad_eps_ez = torch.randn((prepared_scene.Nx, prepared_scene.Ny, prepared_scene.Nz - 1), device=device, dtype=torch.float32)
+
+    actual = pullback_density_gradients(
+        scene,
+        density_tensors=density_tensors,
+        trainable_region_indices=(0, 1),
+        grad_eps_ex=grad_eps_ex,
+        grad_eps_ey=grad_eps_ey,
+        grad_eps_ez=grad_eps_ez,
+        eps0=8.8541878128e-12,
+    )
+    expected = adjoint_baselines.material_pullback_autograd(
+        scene,
+        density_tensors=density_tensors,
+        trainable_region_indices=(0, 1),
+        grad_eps_ex=grad_eps_ex,
+        grad_eps_ey=grad_eps_ey,
+        grad_eps_ez=grad_eps_ez,
+        eps0=8.8541878128e-12,
+    )
+
+    assert len(actual) == len(expected) == 2
+    for actual_grad, expected_grad in zip(actual, expected):
+        assert torch.allclose(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+
+class _DensityPointScene(mw.SceneModule):
+    def __init__(self, init=0.0):
+        super().__init__()
+        self.logits = torch.nn.Parameter(torch.full((1, 1, 1), float(init), device="cuda"))
+
+    def to_scene(self):
+        density = torch.sigmoid(self.logits)
+        scene = mw.Scene(
+            domain=mw.Domain(bounds=((-0.24, 0.24), (-0.24, 0.24), (-0.24, 0.24))),
+            grid=mw.GridSpec.uniform(0.12),
+            boundary=mw.BoundarySpec.pml(num_layers=2, strength=1.0),
+            device="cuda",
+        )
+        scene.add_material_region(
+            mw.MaterialRegion(
+                name="design",
+                geometry=mw.Box(position=(0.0, 0.0, 0.06), size=(0.12, 0.12, 0.12)),
+                density=density,
+                eps_bounds=(1.0, 6.0),
+                mu_bounds=(1.0, 1.0),
+            )
+        )
+        scene.add_source(
+            mw.PointDipole(
+                position=(0.0, 0.0, -0.06),
+                polarization="Ez",
+                width=0.04,
+                source_time=mw.GaussianPulse(frequency=1e9, fwidth=0.25e9, amplitude=50.0),
+            )
+        )
+        scene.add_monitor(mw.PointMonitor("probe", (0.0, 0.0, 0.06), fields=("Ez",)))
+        return scene
+
+
+class _AnalyticBoxPointScene(mw.SceneModule):
+    def __init__(self, init_x=0.10):
+        super().__init__()
+        self.box_x = torch.nn.Parameter(torch.tensor(float(init_x), device="cuda"))
+
+    def to_scene(self):
+        position = torch.stack(
+            (
+                self.box_x,
+                self.box_x.new_tensor(0.0),
+                self.box_x.new_tensor(0.06),
+            )
+        )
+        scene = mw.Scene(
+            domain=mw.Domain(bounds=((-0.24, 0.24), (-0.24, 0.24), (-0.24, 0.24))),
+            grid=mw.GridSpec.uniform(0.12),
+            boundary=mw.BoundarySpec.pml(num_layers=2, strength=1.0),
+            device="cuda",
+            subpixel_samples=5,
+        )
+        scene.add_structure(
+            mw.Structure(
+                name="design_box",
+                geometry=mw.Box(position=position, size=(0.18, 0.18, 0.18)),
+                material=mw.Material(eps_r=20.0),
+            )
+        )
+        scene.add_source(
+            mw.PointDipole(
+                position=(0.0, 0.0, -0.06),
+                polarization="Ez",
+                width=0.04,
+                source_time=mw.GaussianPulse(frequency=1e9, fwidth=0.25e9, amplitude=5000.0),
+            )
+        )
+        scene.add_monitor(mw.PointMonitor("probe", (0.0, 0.0, 0.06), fields=("Ez",)))
+        return scene
+
+
+class _DensitySurfaceSourceScene(mw.SceneModule):
+    def __init__(self, source_kind: str, init=0.0):
+        super().__init__()
+        self.source_kind = source_kind
+        self.logits = torch.nn.Parameter(torch.full((1, 1, 1), float(init), device="cuda"))
+
+    def _build_source(self):
+        if self.source_kind == "plane_wave":
+            return mw.PlaneWave(
+                direction=(1.0, 0.0, 0.0),
+                polarization=(0.0, 0.0, 1.0),
+                source_time=mw.GaussianPulse(frequency=1e9, fwidth=0.25e9, amplitude=40.0),
+                name="pw",
+            )
+        if self.source_kind == "gaussian_beam":
+            return mw.GaussianBeam(
+                direction=(1.0, 0.0, 0.0),
+                polarization=(0.0, 0.0, 1.0),
+                beam_waist=0.18,
+                focus=(-0.06, 0.0, 0.0),
+                source_time=mw.GaussianPulse(frequency=1e9, fwidth=0.25e9, amplitude=40.0),
+                name="beam",
+            )
+        raise ValueError(f"Unsupported source_kind {self.source_kind!r}.")
+
+    def to_scene(self):
+        density = torch.sigmoid(self.logits)
+        scene = mw.Scene(
+            domain=mw.Domain(bounds=((-0.48, 0.48), (-0.48, 0.48), (-0.48, 0.48))),
+            grid=mw.GridSpec.uniform(0.12),
+            boundary=mw.BoundarySpec.pml(num_layers=2, strength=1.0),
+            device="cuda",
+        )
+        scene.add_material_region(
+            mw.MaterialRegion(
+                name="design",
+                geometry=mw.Box(position=(-0.12, 0.0, 0.0), size=(0.24, 0.12, 0.12)),
+                density=density,
+                eps_bounds=(1.0, 6.0),
+                mu_bounds=(1.0, 1.0),
+            )
+        )
+        scene.add_source(self._build_source())
+        scene.add_monitor(mw.PointMonitor("probe", (0.12, 0.0, 0.0), fields=("Ez",)))
+        return scene
+
+
+class _DensityFluxScene(mw.SceneModule):
+    def __init__(self, init=0.0):
+        super().__init__()
+        self.logits = torch.nn.Parameter(torch.full((1, 1, 1), float(init), device="cuda"))
+
+    def to_scene(self):
+        density = torch.sigmoid(self.logits)
+        scene = mw.Scene(
+            domain=mw.Domain(bounds=((-0.24, 0.24), (-0.24, 0.24), (-0.24, 0.24))),
+            grid=mw.GridSpec.uniform(0.12),
+            boundary=mw.BoundarySpec.pml(num_layers=2, strength=1.0),
+            device="cuda",
+        )
+        scene.add_material_region(
+            mw.MaterialRegion(
+                name="design",
+                geometry=mw.Box(position=(0.0, 0.0, 0.06), size=(0.12, 0.12, 0.12)),
+                density=density,
+                eps_bounds=(1.0, 6.0),
+                mu_bounds=(1.0, 1.0),
+            )
+        )
+        scene.add_source(
+            mw.PointDipole(
+                position=(0.0, 0.0, -0.06),
+                polarization="Ez",
+                width=0.04,
+                source_time=mw.GaussianPulse(frequency=1e9, fwidth=0.25e9, amplitude=50.0),
+            )
+        )
+        scene.add_monitor(mw.FluxMonitor("flux_probe", axis="z", position=0.06, normal_direction="+"))
+        return scene
+
+
+class _DensityDispersiveScene(mw.SceneModule):
+    def __init__(self, medium_kind: str, init=0.0):
+        super().__init__()
+        self.material_kind = medium_kind
+        self.logits = torch.nn.Parameter(torch.full((1, 1, 1), float(init), device="cuda"))
+
+    def _build_medium(self):
+        if self.material_kind == "debye":
+            return mw.Material.debye(eps_inf=1.5, delta_eps=2.0, tau=2.0e-10)
+        if self.material_kind == "drude":
+            return mw.Material.drude(eps_inf=1.5, plasma_frequency=2.0e9, gamma=0.3e9)
+        if self.material_kind == "lorentz":
+            return mw.Material.lorentz(
+                eps_inf=1.5,
+                delta_eps=1.2,
+                resonance_frequency=1.0e9,
+                gamma=0.15e9,
+            )
+        raise ValueError(f"Unsupported medium_kind {self.material_kind!r}.")
+
+    def to_scene(self):
+        density = torch.sigmoid(self.logits)
+        scene = mw.Scene(
+            domain=mw.Domain(bounds=((-0.24, 0.24), (-0.24, 0.24), (-0.24, 0.24))),
+            grid=mw.GridSpec.uniform(0.12),
+            boundary=mw.BoundarySpec.pml(num_layers=2, strength=1.0),
+            device="cuda",
+        )
+        scene.add_structure(
+            mw.Structure(
+                name=f"{self.material_kind}_host",
+                geometry=mw.Box(position=(0.0, 0.0, 0.0), size=(0.24, 0.24, 0.24)),
+                material=self._build_medium(),
+            )
+        )
+        scene.add_material_region(
+            mw.MaterialRegion(
+                name="design",
+                geometry=mw.Box(position=(0.0, 0.0, 0.06), size=(0.12, 0.12, 0.12)),
+                density=density,
+                eps_bounds=(1.0, 6.0),
+                mu_bounds=(1.0, 1.0),
+            )
+        )
+        scene.add_source(
+            mw.PointDipole(
+                position=(0.0, 0.0, -0.06),
+                polarization="Ez",
+                width=0.04,
+                source_time=mw.GaussianPulse(frequency=1e9, fwidth=0.25e9, amplitude=50.0),
+            )
+        )
+        scene.add_monitor(mw.PointMonitor("probe", (0.0, 0.0, 0.06), fields=("Ez",)))
+        return scene
+
+
+class _DensityTFSFScene(mw.SceneModule):
+    def __init__(self, source_kind: str, init=0.0):
+        super().__init__()
+        self.source_kind = source_kind
+        self.logits = torch.nn.Parameter(torch.full((1, 1, 1), float(init), device="cuda"))
+
+    def _build_source(self):
+        injection = mw.TFSF(bounds=((-0.36, 0.36), (-0.36, 0.36), (-0.36, 0.36)))
+        common = {
+            "direction": (1.0, 0.0, 0.0),
+            "polarization": (0.0, 0.0, 1.0),
+            "source_time": mw.GaussianPulse(frequency=1.0e9, fwidth=0.25e9, amplitude=40.0),
+            "injection": injection,
+        }
+        if self.source_kind == "plane_wave":
+            return mw.PlaneWave(name="tfsf_pw", **common)
+        if self.source_kind == "gaussian_beam":
+            return mw.GaussianBeam(
+                name="tfsf_beam",
+                direction=(1.0, 0.1, 0.05),
+                polarization=(0.0, 0.4472135955, -0.8944271910),
+                beam_waist=0.18,
+                focus=(-0.12, 0.0, 0.0),
+                source_time=common["source_time"],
+                injection=injection,
+            )
+        raise ValueError(f"Unsupported source_kind {self.source_kind!r}.")
+
+    def to_scene(self):
+        density = torch.sigmoid(self.logits)
+        scene = mw.Scene(
+            domain=mw.Domain(bounds=((-1.2, 1.2), (-1.2, 1.2), (-1.2, 1.2))),
+            grid=mw.GridSpec.uniform(0.12),
+            boundary=mw.BoundarySpec.pml(num_layers=4, strength=1.0),
+            device="cuda",
+        )
+        scene.add_material_region(
+            mw.MaterialRegion(
+                name="design",
+                geometry=mw.Box(position=(0.0, 0.0, 0.0), size=(0.12, 0.12, 0.12)),
+                density=density,
+                eps_bounds=(1.0, 6.0),
+                mu_bounds=(1.0, 1.0),
+            )
+        )
+        scene.add_source(self._build_source())
+        scene.add_monitor(mw.PointMonitor("probe", (0.12, 0.0, 0.0), fields=("Ez",)))
+        return scene
+
+
+class _DensityBlochScene(mw.SceneModule):
+    def __init__(self, init=0.0):
+        super().__init__()
+        self.logits = torch.nn.Parameter(torch.full((1, 1, 1), float(init), device="cuda"))
+
+    def to_scene(self):
+        density = torch.sigmoid(self.logits)
+        scene = mw.Scene(
+            domain=mw.Domain(bounds=((-0.6, 0.6), (-0.6, 0.6), (-0.6, 0.6))),
+            grid=mw.GridSpec.uniform(0.15),
+            boundary=mw.BoundarySpec.bloch((math.pi / 1.2, 0.0, 0.0)),
+            device="cuda",
+        )
+        scene.add_material_region(
+            mw.MaterialRegion(
+                name="design",
+                geometry=mw.Box(position=(0.15, 0.0, 0.0), size=(0.15, 0.15, 0.15)),
+                density=density,
+                eps_bounds=(1.0, 6.0),
+                mu_bounds=(1.0, 1.0),
+            )
+        )
+        scene.add_source(
+            mw.PointDipole(
+                position=(-0.55, 0.0, 0.0),
+                polarization="Ez",
+                width=0.12,
+                source_time=mw.GaussianPulse(frequency=1.0e9, fwidth=0.25e9, amplitude=25.0),
+            )
+        )
+        scene.add_monitor(mw.PointMonitor("probe", (0.15, 0.0, 0.0), fields=("Ez",)))
+        return scene
+
+
+class _UnsupportedSceneParam(mw.SceneModule):
+    def __init__(self):
+        super().__init__()
+        self.offset = torch.nn.Parameter(torch.tensor(0.05, device="cuda"))
+
+    def to_scene(self):
+        scene = mw.Scene(
+            domain=mw.Domain(bounds=((-0.24, 0.24), (-0.24, 0.24), (-0.24, 0.24))),
+            grid=mw.GridSpec.uniform(0.12),
+            boundary=mw.BoundarySpec.pml(num_layers=2, strength=1.0),
+            device="cuda",
+        )
+        scene.add_source(
+            mw.PointDipole(
+                position=(0.0, 0.0, float(self.offset.detach().item())),
+                polarization="Ez",
+                width=0.04,
+                source_time=mw.GaussianPulse(frequency=1e9, fwidth=0.25e9, amplitude=20.0),
+            )
+        )
+        scene.add_monitor(mw.PointMonitor("probe", (0.0, 0.0, 0.0), fields=("Ez",)))
+        return scene
+
+
+def _build_direct_geometry_scene(position: torch.Tensor):
+    scene = mw.Scene(
+        domain=mw.Domain(bounds=((-0.24, 0.24), (-0.24, 0.24), (-0.24, 0.24))),
+        grid=mw.GridSpec.uniform(0.12),
+        boundary=mw.BoundarySpec.pml(num_layers=2, strength=1.0),
+        device="cuda",
+        subpixel_samples=5,
+    )
+    scene.add_structure(
+        mw.Structure(
+            name="direct_box",
+            geometry=mw.Box(position=position, size=(0.18, 0.18, 0.18)),
+            material=mw.Material(eps_r=20.0),
+        )
+    )
+    scene.add_source(
+        mw.PointDipole(
+            position=(0.0, 0.0, -0.06),
+            polarization="Ez",
+            width=0.04,
+            source_time=mw.GaussianPulse(frequency=1e9, fwidth=0.25e9, amplitude=5000.0),
+        )
+    )
+    scene.add_monitor(mw.PointMonitor("probe", (0.0, 0.0, 0.06), fields=("Ez",)))
+    return scene
+
+
+def _loss_from_point_probe(model):
+    result = _build_simulation(model).run()
+    data = result.monitor("probe")["data"]
+    loss = torch.abs(data) ** 2
+    return result, data, loss
+
+
+def _geometry_target_probe(target_x: float):
+    _, data, _ = _loss_from_point_probe(_AnalyticBoxPointScene(init_x=target_x).cuda())
+    return data.detach()
+
+
+def _loss_from_point_probe_target(model, target_data: torch.Tensor):
+    result = _build_simulation(model).run()
+    data = result.monitor("probe")["data"]
+    loss = torch.abs(data - target_data) ** 2
+    return result, data, loss
+
+
+def _loss_from_surface_probe(model):
+    result = _build_simulation(model, time_steps=48).run()
+    data = result.monitor("probe")["data"]
+    loss = torch.abs(data) ** 2
+    return result, data, loss
+
+
+def _loss_from_dispersive_probe(model):
+    result = _build_simulation(model, time_steps=36).run()
+    data = result.monitor("probe")["data"]
+    loss = torch.abs(data) ** 2
+    return result, data, loss
+
+
+def _loss_from_tfsf_probe(model):
+    result = _build_simulation(model, time_steps=48).run()
+    data = result.monitor("probe")["data"]
+    loss = torch.abs(data) ** 2
+    return result, data, loss
+
+
+def _loss_from_bloch_probe(model):
+    result = _build_simulation(model, time_steps=40).run()
+    data = result.monitor("probe")["data"]
+    loss = torch.abs(data) ** 2
+    return result, data, loss
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_backpropagates_to_scene_module_density_parameters():
+    model = _DensityPointScene().cuda()
+
+    result, data, loss = _loss_from_point_probe(model)
+    assert torch.is_tensor(data)
+    assert data.is_cuda
+    assert data.requires_grad
+
+    loss.backward()
+
+    assert model.logits.grad is not None
+    assert model.logits.grad.shape == model.logits.shape
+    assert torch.isfinite(model.logits.grad).all()
+    assert result.monitor("probe")["data"].grad_fn is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_backpropagates_to_direct_scene_geometry_parameters():
+    position = torch.nn.Parameter(torch.tensor([0.10, 0.0, 0.06], device="cuda"))
+    target_data = _geometry_target_probe(-0.08)
+
+    result, data, loss = _loss_from_point_probe_target(_build_direct_geometry_scene(position), target_data)
+    assert torch.is_tensor(data)
+    assert data.is_cuda
+    assert data.requires_grad
+
+    loss.backward()
+
+    assert position.grad is not None
+    assert position.grad.shape == position.shape
+    assert torch.isfinite(position.grad).all()
+    assert abs(float(position.grad[0].item())) > 1.0e-10
+    assert result.monitor("probe")["data"].grad_fn is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_backpropagates_to_scene_module_geometry_parameters():
+    model = _AnalyticBoxPointScene(init_x=0.10).cuda()
+    target_data = _geometry_target_probe(-0.08)
+
+    result, data, loss = _loss_from_point_probe_target(model, target_data)
+    assert torch.is_tensor(data)
+    assert data.is_cuda
+    assert data.requires_grad
+
+    loss.backward()
+
+    assert model.box_x.grad is not None
+    assert torch.isfinite(model.box_x.grad).all()
+    assert abs(model.box_x.grad.item()) > 1.0e-10
+    assert result.monitor("probe")["data"].grad_fn is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_matches_central_difference_for_scene_module_geometry_position():
+    model = _AnalyticBoxPointScene(init_x=0.10).cuda()
+    target_data = _geometry_target_probe(-0.08)
+
+    _, _, loss = _loss_from_point_probe_target(model, target_data)
+    loss.backward()
+    backward_grad = model.box_x.grad.detach().clone()
+    assert torch.isfinite(backward_grad)
+
+    delta = 1.0e-2
+    with torch.no_grad():
+        base = model.box_x.detach().clone()
+        model.box_x.copy_(base + delta)
+    _, _, loss_plus = _loss_from_point_probe_target(model, target_data)
+    with torch.no_grad():
+        model.box_x.copy_(base - delta)
+    _, _, loss_minus = _loss_from_point_probe_target(model, target_data)
+    with torch.no_grad():
+        model.box_x.copy_(base)
+
+    finite_difference = (loss_plus - loss_minus) / (2.0 * delta)
+    assert torch.allclose(
+        backward_grad,
+        torch.full_like(backward_grad, finite_difference.item()),
+        rtol=6e-1,
+        atol=1e-10,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_optimizer_step_reduces_geometry_target_loss():
+    target_x = -0.08
+    target_data = _geometry_target_probe(target_x)
+
+    model = _AnalyticBoxPointScene(init_x=0.16).cuda()
+    optimizer = torch.optim.Adam(model.parameters(), lr=5.0e-2)
+    initial_distance = abs(float(model.box_x.detach().item()) - target_x)
+
+    initial_loss_value = None
+    final_loss_value = None
+    for _ in range(6):
+        optimizer.zero_grad()
+        _, _data, loss = _loss_from_point_probe_target(model, target_data)
+        if initial_loss_value is None:
+            initial_loss_value = float(loss.item())
+        loss.backward()
+        optimizer.step()
+        final_loss_value = float(loss.item())
+
+    assert initial_loss_value is not None
+    assert final_loss_value is not None
+    assert final_loss_value < initial_loss_value
+    assert abs(float(model.box_x.detach().item()) - target_x) < initial_distance
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_matches_central_difference_for_scene_module_logit():
+    model = _DensityPointScene(init=0.0).cuda()
+
+    _, _, loss = _loss_from_point_probe(model)
+    loss.backward()
+    backward_grad = model.logits.grad.detach().clone()
+    assert torch.isfinite(backward_grad).all()
+
+    delta = 1.0e-2
+    with torch.no_grad():
+        base = model.logits.detach().clone()
+        model.logits.copy_(base + delta)
+    _, _, loss_plus = _loss_from_point_probe(model)
+    with torch.no_grad():
+        model.logits.copy_(base - delta)
+    _, _, loss_minus = _loss_from_point_probe(model)
+    with torch.no_grad():
+        model.logits.copy_(base)
+
+    finite_difference = (loss_plus - loss_minus) / (2.0 * delta)
+    assert torch.allclose(
+        backward_grad,
+        torch.full_like(backward_grad, finite_difference.item()),
+        rtol=5e-3,
+        atol=1e-15,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+@pytest.mark.parametrize("source_kind", ["plane_wave", "gaussian_beam"])
+def test_fdtd_gradient_bridge_matches_central_difference_for_soft_surface_source_pullback(source_kind):
+    model = _DensitySurfaceSourceScene(source_kind=source_kind, init=0.0).cuda()
+
+    _, data, loss = _loss_from_surface_probe(model)
+    assert torch.is_tensor(data)
+    assert data.is_cuda
+    assert data.requires_grad
+
+    loss.backward()
+    backward_grad = model.logits.grad.detach().clone()
+
+    delta = 1.0e-2
+    with torch.no_grad():
+        base = model.logits.detach().clone()
+        model.logits.copy_(base + delta)
+    _, _, loss_plus = _loss_from_surface_probe(model)
+    with torch.no_grad():
+        model.logits.copy_(base - delta)
+    _, _, loss_minus = _loss_from_surface_probe(model)
+    with torch.no_grad():
+        model.logits.copy_(base)
+
+    finite_difference = (loss_plus - loss_minus) / (2.0 * delta)
+    assert torch.allclose(
+        backward_grad,
+        torch.full_like(backward_grad, finite_difference.item()),
+        rtol=5e-2,
+        atol=1e-15,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+@pytest.mark.parametrize("medium_kind", ["debye", "drude", "lorentz"])
+def test_fdtd_gradient_bridge_matches_central_difference_for_dispersive_materials(medium_kind):
+    model = _DensityDispersiveScene(medium_kind=medium_kind, init=0.0).cuda()
+
+    _, data, loss = _loss_from_dispersive_probe(model)
+    assert torch.is_tensor(data)
+    assert data.is_cuda
+    assert data.requires_grad
+
+    loss.backward()
+    backward_grad = model.logits.grad.detach().clone()
+    assert torch.isfinite(backward_grad).all()
+
+    delta = 1.0e-2
+    with torch.no_grad():
+        base = model.logits.detach().clone()
+        model.logits.copy_(base + delta)
+    _, _, loss_plus = _loss_from_dispersive_probe(model)
+    with torch.no_grad():
+        model.logits.copy_(base - delta)
+    _, _, loss_minus = _loss_from_dispersive_probe(model)
+    with torch.no_grad():
+        model.logits.copy_(base)
+
+    finite_difference = (loss_plus - loss_minus) / (2.0 * delta)
+    assert torch.allclose(
+        backward_grad,
+        torch.full_like(backward_grad, finite_difference.item()),
+        rtol=6e-2,
+        atol=1e-15,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+@pytest.mark.parametrize("source_kind", ["plane_wave", "gaussian_beam"])
+def test_fdtd_gradient_bridge_matches_central_difference_for_tfsf_sources(source_kind):
+    model = _DensityTFSFScene(source_kind=source_kind, init=0.0).cuda()
+
+    _, data, loss = _loss_from_tfsf_probe(model)
+    assert torch.is_tensor(data)
+    assert data.is_cuda
+    assert data.requires_grad
+
+    loss.backward()
+    backward_grad = model.logits.grad.detach().clone()
+    assert torch.isfinite(backward_grad).all()
+
+    delta = 1.0e-2
+    with torch.no_grad():
+        base = model.logits.detach().clone()
+        model.logits.copy_(base + delta)
+    _, _, loss_plus = _loss_from_tfsf_probe(model)
+    with torch.no_grad():
+        model.logits.copy_(base - delta)
+    _, _, loss_minus = _loss_from_tfsf_probe(model)
+    with torch.no_grad():
+        model.logits.copy_(base)
+
+    finite_difference = (loss_plus - loss_minus) / (2.0 * delta)
+    assert torch.allclose(
+        backward_grad,
+        torch.full_like(backward_grad, finite_difference.item()),
+        rtol=8e-2,
+        atol=1e-15,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_matches_central_difference_for_bloch_boundaries():
+    model = _DensityBlochScene(init=0.0).cuda()
+
+    _, data, loss = _loss_from_bloch_probe(model)
+    assert torch.is_tensor(data)
+    assert data.is_cuda
+    assert data.requires_grad
+    assert torch.is_complex(data)
+
+    loss.backward()
+    backward_grad = model.logits.grad.detach().clone()
+    assert torch.isfinite(backward_grad).all()
+
+    delta = 1.0e-2
+    with torch.no_grad():
+        base = model.logits.detach().clone()
+        model.logits.copy_(base + delta)
+    _, _, loss_plus = _loss_from_bloch_probe(model)
+    with torch.no_grad():
+        model.logits.copy_(base - delta)
+    _, _, loss_minus = _loss_from_bloch_probe(model)
+    with torch.no_grad():
+        model.logits.copy_(base)
+
+    finite_difference = (loss_plus - loss_minus) / (2.0 * delta)
+    assert torch.allclose(
+        backward_grad,
+        torch.full_like(backward_grad, finite_difference.item()),
+        rtol=6e-2,
+        atol=1e-15,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_optimizer_step_reduces_loss():
+    model = _DensityPointScene(init=0.0).cuda()
+    optimizer = torch.optim.SGD(model.parameters(), lr=1.0e13)
+
+    optimizer.zero_grad()
+    _, _, initial_loss = _loss_from_point_probe(model)
+    initial_value = float(initial_loss.item())
+    initial_loss.backward()
+    optimizer.step()
+
+    _, _, final_loss = _loss_from_point_probe(model)
+    assert float(final_loss.item()) < initial_value
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_backward_profile_reports_expected_sections():
+    model = _DensityPointScene(init=0.0).cuda()
+    simulation = _build_simulation(model)
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    profile = bridge.backward_profile()
+
+    assert profile is not None
+    assert profile["timer"] in {"cuda_event", "perf_counter"}
+    assert profile["steps"] == bridge._time_steps
+    assert profile["segments"] == len(bridge._last_checkpoints)
+    assert profile["checkpoint_stride"] == 4
+    assert profile["total_wall_ms"] >= 0.0
+    for name in (
+        "seed_build",
+        "segment_replay",
+        "seed_injection",
+        "state_clone",
+        "step_forward",
+        "step_vjp",
+        "material_pullback",
+    ):
+        assert name in profile["sections_ms"]
+        assert name in profile["counts"]
+        assert name in profile["mean_section_ms"]
+    assert profile["counts"]["segment_replay"] == len(bridge._last_checkpoints)
+    assert profile["counts"]["seed_injection"] == bridge._time_steps
+    assert profile["counts"]["state_clone"] == bridge._time_steps
+    assert profile["counts"]["step_forward"] == bridge._time_steps
+    assert profile["counts"]["step_vjp"] == bridge._time_steps
+    assert profile["sections_ms"]["step_forward"] >= 0.0
+    assert profile["sections_ms"]["step_vjp"] >= 0.0
+    assert profile["material_pullback_backend"] == "autograd_material_graph"
+    assert profile["seed_injection_backend"] == "device_batched"
+    assert profile["seed_batch_counts"]["point"] > 0
+    assert profile["reverse_backend_counts"].get("slang_cpml", 0) == bridge._time_steps
+    assert profile["reverse_backend_counts"].get("torch_vjp", 0) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+@pytest.mark.parametrize("source_kind", ["plane_wave", "gaussian_beam"])
+def test_fdtd_gradient_bridge_backward_profile_uses_slang_cpml_for_soft_surface_sources(source_kind):
+    model = _DensitySurfaceSourceScene(source_kind=source_kind, init=0.0).cuda()
+    simulation = _build_simulation(model, time_steps=24)
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    profile = bridge.backward_profile()
+
+    assert profile["seed_injection_backend"] == "device_batched"
+    assert profile["seed_batch_counts"]["point"] > 0
+    assert profile["reverse_backend_counts"].get("slang_cpml", 0) == bridge._time_steps
+    assert profile["reverse_backend_counts"].get("torch_vjp", 0) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+@pytest.mark.parametrize("source_kind", ["plane_wave", "gaussian_beam"])
+def test_fdtd_gradient_bridge_backward_profile_uses_slang_tfsf_for_tfsf_sources(source_kind):
+    model = _DensityTFSFScene(source_kind=source_kind, init=0.0).cuda()
+    simulation = _build_simulation(model, time_steps=24)
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    profile = bridge.backward_profile()
+
+    assert profile["seed_injection_backend"] == "device_batched"
+    assert profile["seed_batch_counts"]["point"] > 0
+    assert profile["reverse_backend_counts"].get("slang_tfsf_cpml", 0) == bridge._time_steps
+    assert profile["reverse_backend_counts"].get("torch_vjp", 0) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_backward_profile_uses_slang_bloch_for_bloch_boundaries():
+    model = _DensityBlochScene(init=0.0).cuda()
+    simulation = _build_simulation(model, time_steps=40)
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    profile = bridge.backward_profile()
+
+    assert profile["seed_injection_backend"] == "device_batched"
+    assert profile["seed_batch_counts"]["point"] > 0
+    assert profile["reverse_backend_counts"].get("slang_bloch", 0) == bridge._time_steps
+    assert profile["reverse_backend_counts"].get("torch_vjp", 0) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_backward_profile_uses_slang_dispersive_cpml_for_dispersive_materials():
+    model = _DensityDispersiveScene(medium_kind="debye", init=0.0).cuda()
+    simulation = _build_simulation(model, time_steps=36)
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    profile = bridge.backward_profile()
+
+    assert profile["seed_injection_backend"] == "device_batched"
+    assert profile["seed_batch_counts"]["point"] > 0
+    assert profile["reverse_backend_counts"].get("slang_dispersive_cpml", 0) == bridge._time_steps
+    assert profile["reverse_backend_counts"].get("torch_vjp", 0) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_backward_profile_uses_device_batched_dense_seeds():
+    model = _DensityPointScene(init=0.0).cuda()
+    simulation = mw.Simulation.fdtd(
+        model,
+        frequencies=[1e9],
+        run_time=mw.TimeConfig(time_steps=24),
+        spectral_sampler=mw.SpectralSampler(window="none"),
+        full_field_dft=True,
+    )
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    profile = bridge.backward_profile()
+
+    assert profile["seed_injection_backend"] == "device_batched"
+    assert profile["seed_batch_counts"]["dense"] > 0
+    assert profile["seed_batch_counts"]["point"] > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_backward_profile_uses_device_batched_plane_seeds():
+    model = _DensityFluxScene(init=0.0).cuda()
+    simulation = _build_simulation(model, time_steps=24)
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    profile = bridge.backward_profile()
+
+    assert profile["seed_injection_backend"] == "device_batched"
+    assert profile["seed_batch_counts"]["plane"] > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_checkpoint_replay_matches_forward_state():
+    model = _DensityPointScene(init=0.0).cuda()
+    simulation = _build_simulation(model)
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    solver = bridge._last_solver
+    full_states = _replay_segment_states(
+        solver,
+        bridge._last_checkpoints[0],
+        0,
+        bridge._time_steps,
+    )
+    for checkpoint in bridge._last_checkpoints:
+        reference_state = full_states[checkpoint.step]
+        for name in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz"):
+            assert torch.allclose(checkpoint.tensors[name], reference_state[name], rtol=1e-5, atol=1e-5)
+
+    terminal_state = full_states[-1]
+    for name in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz"):
+        assert torch.allclose(terminal_state[name], getattr(solver, name), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_checkpoint_replay_matches_tfsf_forward_state():
+    model = _DensityTFSFScene(source_kind="plane_wave", init=0.0).cuda()
+    simulation = _build_simulation(model, time_steps=48)
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    solver = bridge._last_solver
+    full_states = _replay_segment_states(
+        solver,
+        bridge._last_checkpoints[0],
+        0,
+        bridge._time_steps,
+    )
+    for checkpoint in bridge._last_checkpoints:
+        reference_state = full_states[checkpoint.step]
+        for name, tensor in checkpoint.tensors.items():
+            if name.startswith("psi_"):
+                continue
+            assert torch.allclose(tensor, reference_state[name], rtol=1e-5, atol=1e-5)
+
+    terminal_state = full_states[-1]
+    for name in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz"):
+        assert torch.allclose(terminal_state[name], getattr(solver, name), rtol=1e-5, atol=1e-5)
+    auxiliary_grid = solver._tfsf_state["auxiliary_grid"]
+    assert torch.allclose(terminal_state["tfsf_aux_electric"], auxiliary_grid.electric, rtol=1e-5, atol=1e-5)
+    assert torch.allclose(terminal_state["tfsf_aux_magnetic"], auxiliary_grid.magnetic, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_checkpoint_replay_matches_bloch_forward_state():
+    model = _DensityBlochScene(init=0.0).cuda()
+    simulation = _build_simulation(model, time_steps=40)
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    solver = bridge._last_solver
+    full_states = _replay_segment_states(
+        solver,
+        bridge._last_checkpoints[0],
+        0,
+        bridge._time_steps,
+    )
+    for checkpoint in bridge._last_checkpoints:
+        reference_state = full_states[checkpoint.step]
+        for name, tensor in checkpoint.tensors.items():
+            assert torch.allclose(tensor, reference_state[name], rtol=1e-5, atol=1e-5)
+
+    terminal_state = full_states[-1]
+    for name in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz", "Ex_imag", "Ey_imag", "Ez_imag", "Hx_imag", "Hy_imag", "Hz_imag"):
+        assert torch.allclose(terminal_state[name], getattr(solver, name), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_checkpoint_replay_matches_dispersive_forward_state():
+    model = _DensityDispersiveScene(medium_kind="debye", init=0.0).cuda()
+    simulation = _build_simulation(model, time_steps=36)
+    bridge = _FDTDGradientBridge(simulation)
+    bridge.forward(tuple(bridge.material_inputs))
+
+    solver = bridge._last_solver
+    full_states = _replay_segment_states(
+        solver,
+        bridge._last_checkpoints[0],
+        0,
+        bridge._time_steps,
+    )
+    for checkpoint in bridge._last_checkpoints:
+        reference_state = full_states[checkpoint.step]
+        for name, tensor in checkpoint.tensors.items():
+            if name.startswith("psi_"):
+                continue
+            assert torch.allclose(tensor, reference_state[name], rtol=1e-5, atol=1e-5)
+
+    terminal_state = full_states[-1]
+    for name in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz"):
+        assert torch.allclose(terminal_state[name], getattr(solver, name), rtol=1e-5, atol=1e-5)
+    for component_name in ("Ex", "Ey", "Ez"):
+        component_templates = solver._dispersive_templates.get(component_name, {})
+        for model_name in ("debye", "drude", "lorentz"):
+            for index, entry in enumerate(component_templates.get(model_name, ())):
+                if model_name != "drude":
+                    polarization_name = dispersive_state_name(component_name, model_name, index, "polarization")
+                    assert torch.allclose(terminal_state[polarization_name], entry["polarization"], rtol=1e-5, atol=1e-5)
+                current_name = dispersive_state_name(component_name, model_name, index, "current")
+                assert torch.allclose(terminal_state[current_name], entry["current"], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for slang FDTD")
+def test_fdtd_gradient_bridge_rejects_scene_module_parameters_outside_material_graph():
+    model = _UnsupportedSceneParam().cuda()
+
+    with pytest.raises(NotImplementedError, match="prepared-scene material tensors"):
+        _build_simulation(model).run()
